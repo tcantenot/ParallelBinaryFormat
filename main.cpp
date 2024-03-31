@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <mutex>
+#include <queue>
 #include <thread>
 #include <vector>
 
@@ -278,9 +279,9 @@ namespace details {
 uint32_t GetChunkUncompressedByteSize(uint64_t srcByteSize)
 {
 	// Constraint: must generate at most BinDataHeader::MAX_CHUNKS chunks
-	const size_t maxNumChunks = BinDataHeader::MAX_CHUNKS;
-	size_t size = 4 * 1024 * 1024; // 4Mo
-	size_t numChunks = (srcByteSize + size - 1) / size;
+	const uint64_t maxNumChunks = BinDataHeader::MAX_CHUNKS;
+	uint32_t size = 4ull * 1024 * 1024; // 4Mo // TODO: tune this (make it dependenton srcByteSize?)
+	uint64_t numChunks = (srcByteSize + size - 1) / size;
 	while(numChunks > maxNumChunks)
 	{
 		size <<= 1;
@@ -338,7 +339,7 @@ uint64_t Uncompress(void * dst, void const * src, uint64_t srcByteSize, uint64_t
 	#endif
 }
 
-uint64_t GetCompressedBinaryDataByteSizeUpperBound(size_t uncompressedByteSize)
+uint64_t GetCompressedBinaryDataByteSizeUpperBound(uint64_t uncompressedByteSize)
 {
 	const uint32_t chunkUncompressedByteSize = details::GetChunkUncompressedByteSize(uncompressedByteSize);
 	const uint64_t numChunks = (uncompressedByteSize + chunkUncompressedByteSize - 1) / chunkUncompressedByteSize;
@@ -436,10 +437,50 @@ uint64_t CompressedBinaryData(void * compressedData, void const * uncompressedDa
 	#endif
 }
 
+BinDataHeader const & GetBinDataHeader(void const * compressedData)
+{
+	return *(BinDataHeader const *)compressedData;
+}
+
 uint64_t GetUncompressedBinaryDataByteSize(void const * compressedData)
 {
+	return GetBinDataHeader(compressedData).uncompressedByteSize;
+}
+
+uint64_t GetCompressedBinaryDataNumChunks(void const * compressedData)
+{
+	return uint64_t(GetBinDataHeader(compressedData).numChunks) + 1;
+}
+
+
+using ChunkDecompressionFunc = void (*)(unsigned char const * pSrcChunkData, uint32_t srcChunkByteSize, uint64_t dstByteOffset, uint32_t dstChunkByteSize, void * userdata);
+
+uint64_t UncompressedBinaryData(void const * compressedData, uint64_t compressedDataByteSize, ChunkDecompressionFunc chunkDecompressionFunc, void * userdata = nullptr)
+{
+	unsigned char const * pBaseCompressedData = (unsigned char const *)compressedData;
+
 	BinDataHeader const * pHeader = (BinDataHeader const *)compressedData;
-	return pHeader->uncompressedByteSize;
+
+	const uint64_t dstUncompressedByteSize = pHeader->uncompressedByteSize;
+
+	const uint64_t numChunks = uint64_t(pHeader->numChunks) + 1;
+	const uint32_t chunkUncompressedByteSize = pHeader->chunkUncompressedByteSize;
+
+	BinDataChunkHeader const * pChunksHeaders = (BinDataChunkHeader *)(pBaseCompressedData + sizeof(BinDataHeader));
+	unsigned char const * pBaseCompressedChunksData = pBaseCompressedData + sizeof(BinDataHeader) + numChunks * sizeof(BinDataChunkHeader);
+
+	for(uint64_t i = 0; i < numChunks; ++i)
+	{
+		unsigned char const * pSrcChunkData = pBaseCompressedChunksData + pChunksHeaders[i].byteOffset;
+		const uint32_t srcChunkByteSize = pChunksHeaders[i].compressedByteSize;
+
+		const uint64_t dstByteOffset = i * chunkUncompressedByteSize;
+		const uint32_t dstChunkByteSize = i < numChunks-1 ? chunkUncompressedByteSize : dstUncompressedByteSize - i * chunkUncompressedByteSize;
+
+		chunkDecompressionFunc(pSrcChunkData, srcChunkByteSize, dstByteOffset, dstChunkByteSize, userdata);
+	}
+
+	return dstUncompressedByteSize;
 }
 
 // \brief Uncompress binary data
@@ -450,65 +491,13 @@ uint64_t GetUncompressedBinaryDataByteSize(void const * compressedData)
 // \return The size of the uncompressed binary data (equal to value returned by GetUncompressedBinaryDataByteSize) if successful, 0 otherwise.
 uint64_t UncompressedBinaryData(void * uncompressedData, void const * compressedData, uint64_t compressedDataByteSize, uint64_t uncompressedDataMaxByteSize)
 {
-	unsigned char const * pBaseCompressedData = (unsigned char const *)compressedData;
-
-	BinDataHeader const * pHeader = (BinDataHeader const *)compressedData;
-
-	const uint64_t dstUncompressedByteSize = pHeader->uncompressedByteSize;
-	if(dstUncompressedByteSize > uncompressedDataMaxByteSize)
-		return 0;
-
-	const uint64_t numChunks = uint64_t(pHeader->numChunks) + 1;
-	const uint32_t chunkUncompressedByteSize = pHeader->chunkUncompressedByteSize;
-
-	BinDataChunkHeader const * pChunksHeaders = (BinDataChunkHeader *)(pBaseCompressedData + sizeof(BinDataHeader));
-	unsigned char const * pBaseCompressedChunksData = pBaseCompressedData + sizeof(BinDataHeader) + numChunks * sizeof(BinDataChunkHeader);
-
-	unsigned char * pBaseUncompressedData = (unsigned char *)uncompressedData;
-	for(uint64_t i = 0; i < numChunks; ++i)
+	void * userdata = uncompressedData;
+	const auto chunkDecompressionFunc = [](unsigned char const * pSrcChunkData, uint32_t srcChunkByteSize, uint64_t dstByteOffset, uint32_t dstChunkByteSize, void * userdata)
 	{
-		unsigned char const * pSrcChunkData = pBaseCompressedChunksData + pChunksHeaders[i].byteOffset;
-		const uint32_t srcChunkByteSize = pChunksHeaders[i].compressedByteSize;
-
-		unsigned char * pDstChunkData = pBaseUncompressedData + i * chunkUncompressedByteSize;
-		const uint32_t dstChunkByteSize = i < numChunks-1 ? chunkUncompressedByteSize : dstUncompressedByteSize - i * chunkUncompressedByteSize;
-
-		const uint64_t dstChunkUncompressedByteSize = Uncompress(pDstChunkData, pSrcChunkData, srcChunkByteSize, dstChunkByteSize);
-
-		assert(dstChunkUncompressedByteSize == dstChunkByteSize);
-	}
-
-	return dstUncompressedByteSize;
-
-	// Note: could be uncompressed in parallel
-	#if 0
-	struct DataChunkToProcess
-	{
-		unsigned char * src;
-		unsigned char * dst;
-		uint32_t srcByteSize;
-		uint32_t dstMaxByteSize;
+		unsigned char * pDstChunkData = (unsigned char*)userdata + dstByteOffset;
+		Uncompress(pDstChunkData, pSrcChunkData, srcChunkByteSize, dstChunkByteSize);
 	};
-
-	// TODO: use SPMC queue?
-	std::vector<DataChunkToProcess> dataChunksToProcess;
-	dataChunksToProcess.reserve(numChunks);
-
-	unsigned char * pBaseUncompressedData = (unsigned char *)uncompressedData;
-	for(uint64_t i = 0; i < numChunks; ++i)
-	{
-		unsigned char const * pSrcChunkData = pBaseCompressedChunksData + pChunksHeaders[i].byteOffset;
-		const uint32_t srcChunkByteSize = pChunksHeaders[i].compressedByteSize;
-		unsigned char * pDstChunkData = pBaseUncompressedData + i * chunkUncompressedByteSize;
-		const uint32_t dstChunkByteSize = i < numChunks-1 ? chunkUncompressedByteSize : dstUncompressedByteSize - i * chunkUncompressedByteSize;
-		dataChunksToProcess.emplace_back(pDstChunkData, pSrcChunkData, srcChunkByteSize, dstChunkByteSize);
-	}
-
-	parallel_for(DataChunkToProcess const & chunk: dataChunksToProcess)
-	{
-		const uint64_t dstChunkUncompressedByteSize = Uncompress(chunk.dst, chunk.src, chunk.srcByteSize, chunk.dstMaxByteSize);
-	}
-	#endif
+	return UncompressedBinaryData(compressedData, compressedDataByteSize, chunkDecompressionFunc, userdata);
 }
 
 void PrintCompressedBinaryDataInfo(void * compressedData)
@@ -525,44 +514,254 @@ void PrintCompressedBinaryDataInfo(void * compressedData)
 
 int BinaryFormatTests()
 {
-	const uint64_t N = (1024 * 1024 * 1024) / sizeof(uint64_t);
+	#if ENABLE_PIX_RUNTIME
+	HMODULE pixModule = PIXLoadLatestWinPixTimingCapturerLibrary();
+	if(!pixModule)
+	{
+		DWORD errorCode = GetLastError();
+		fprintf(stderr, "PIXLoadLatestWinPixTimingCapturerLibrary failed with error code: %d\n", errorCode);
+		return 1;
+	}
+
+	wchar_t captureFilename[256];
+	std::time_t time = std::time(nullptr);
+	std::tm * calendarTime = std::localtime(&time);
+	swprintf(captureFilename, sizeof(captureFilename)/sizeof(captureFilename[0]),
+		L"BinaryFormatTests(%d-%02d-%02d.%02d-%02d-%02d).wpix",
+		calendarTime->tm_year + 1900,
+		calendarTime->tm_mon + 1,
+		calendarTime->tm_mday,
+		calendarTime->tm_hour,
+		calendarTime->tm_min,
+		calendarTime->tm_sec
+	);
+
+	PIXCaptureParameters params;
+	params.TimingCaptureParameters.FileName = captureFilename;
+	params.TimingCaptureParameters.CaptureCallstacks = true;
+	params.TimingCaptureParameters.CaptureCpuSamples = 8000u; // must be 1000u, 4000, or 8000u. It's otherwise ignored.
+	params.TimingCaptureParameters.CaptureFileIO = true;
+	params.TimingCaptureParameters.CaptureVirtualAllocEvents = true;
+	params.TimingCaptureParameters.CaptureHeapAllocEvents = true;
+	params.TimingCaptureParameters.CaptureStorage = PIXCaptureParameters::PIXCaptureStorage::Memory;
+
+	PIXBeginCapture(PIX_CAPTURE_TIMING, &params);
+	#endif
+
+	K_PIX_BEGIN_EVENT(0xFFFFFFFF, "BinaryFormatTests");
+
+	K_PIX_BEGIN_EVENT(0xFFFF0000, "Init data");
+
+	const uint64_t N = (1ull * 1024 * 1024 * 1024) / sizeof(uint64_t);
 	const uint64_t srcDataByteSize = N * sizeof(uint64_t);
 	uint64_t * srcData = (uint64_t *)malloc(srcDataByteSize);
-
 	for(uint64_t i = 0; i < N; ++i)
 		srcData[i] = i;
 
+	K_PIX_END_EVENT();
+
+	K_PIX_BEGIN_EVENT(0xFFFF8800, "Allocate compression buffer");
+
 	const uint64_t compressedBinaryDataByteSizeUpperBound = GetCompressedBinaryDataByteSizeUpperBound(srcDataByteSize);
 	void * compressionBuffer = malloc(compressedBinaryDataByteSizeUpperBound);
+	
+	K_PIX_END_EVENT();
 
+	K_PIX_BEGIN_EVENT(0xFFFFFF00, "Compress data");
+
+	auto start = std::chrono::high_resolution_clock::now();
 	const uint64_t compressedBinaryDataByteSize = CompressedBinaryData(compressionBuffer, srcData, srcDataByteSize, compressedBinaryDataByteSizeUpperBound);
+	auto stop = std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+	double duration_ms = duration.count() / 1000.0;
+	printf("Compression time: %fms - [standard]\n", duration_ms);
 
 	printf("Src byte size: %s\n", HumanReadableByteSizeStr(srcDataByteSize).c_str());
 	printf("Dst byte size: %s\n", HumanReadableByteSizeStr(compressedBinaryDataByteSize).c_str());
 	printf("Compression ratio: %f%%\n", double(compressedBinaryDataByteSize)/srcDataByteSize * 100.0);
 	PrintCompressedBinaryDataInfo(compressionBuffer);
+	
+	K_PIX_END_EVENT();
 
 	const uint64_t uncompressedBinaryDataByteSize = GetUncompressedBinaryDataByteSize(compressionBuffer);
 	assert(uncompressedBinaryDataByteSize == srcDataByteSize);
 
 	void * decompressionBuffer = malloc(uncompressedBinaryDataByteSize);
 
-	//memset(decompressionBuffer, 0xFF, uncompressedBinaryDataByteSize);
-
-	const uint64_t uncompressedBinaryDataByteSize2 = UncompressedBinaryData(decompressionBuffer, compressionBuffer, compressedBinaryDataByteSize, uncompressedBinaryDataByteSize);
-	assert(uncompressedBinaryDataByteSize2 == uncompressedBinaryDataByteSize);
-	assert(uncompressedBinaryDataByteSize2 == srcDataByteSize);
-
-	uint64_t const * uncompressedData = (uint64_t const *)decompressionBuffer;
-	int cmp = memcmp(srcData, uncompressedData, srcDataByteSize);
-	if(cmp != 0)
+	// Standard
+	K_PIX_BEGIN_EVENT(0xFF00FF00, "Uncompress data - standard");
 	{
-		fprintf(stderr, "Error while decompressing: uncompressedData != srcData\n");
+		memset(decompressionBuffer, 0xFF, uncompressedBinaryDataByteSize);
+
+		start = std::chrono::high_resolution_clock::now();
+		const uint64_t uncompressedBinaryDataByteSize2 = UncompressedBinaryData(decompressionBuffer, compressionBuffer, compressedBinaryDataByteSize, uncompressedBinaryDataByteSize);
+		stop = std::chrono::high_resolution_clock::now();
+		duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+		duration_ms = duration.count() / 1000.0;
+
+		printf("Decompression time: %fms - [standard]\n", duration_ms);
+
+		assert(uncompressedBinaryDataByteSize2 == uncompressedBinaryDataByteSize);
+		assert(uncompressedBinaryDataByteSize2 == srcDataByteSize);
+
+		uint64_t const * uncompressedData = (uint64_t const *)decompressionBuffer;
+		int cmp = memcmp(srcData, uncompressedData, srcDataByteSize);
+		if(cmp != 0)
+		{
+			fprintf(stderr, "Error while decompressing: uncompressedData != srcData [standard]\n");
+		}
+	}
+	K_PIX_END_EVENT();
+
+	// Parallel
+	K_PIX_BEGIN_EVENT(0xFF0000FF, "Uncompress data - parallel");
+	{
+		memset(decompressionBuffer, 0xFF, uncompressedBinaryDataByteSize);
+
+		struct DataChunkToProcess
+		{
+			unsigned char * dst;
+			unsigned char const * src;
+			uint32_t srcByteSize;
+			uint32_t dstMaxByteSize;
+		};
+
+		// TODO: use SPMC queue?
+		std::queue<DataChunkToProcess> dataChunksToProcess;
+
+		std::mutex queueMutex;
+		std::condition_variable queueCV;
+		bool bReady = false;
+		bool bKillThreads = false;
+
+		const int numThreads = std::thread::hardware_concurrency() - 2;
+		printf("Num threads: %d\n", numThreads);
+		std::vector<std::thread> workers(numThreads);
+		for(int i = 0; i < numThreads; ++i)
+		{
+			workers[i] = std::thread([&, i]()
+			{
+				while(true)
+				{
+					std::unique_lock<std::mutex> lock(queueMutex);
+					queueCV.wait(lock, [&]{ return (bReady && !dataChunksToProcess.empty()) || bKillThreads; });
+
+					if(bKillThreads)
+						break;
+
+					DataChunkToProcess chunk = dataChunksToProcess.front();
+					dataChunksToProcess.pop();
+					lock.unlock();
+
+					K_PIX_BEGIN_EVENT(0xFF00FFFF, "Uncompress chunk - parallel");
+					Uncompress(chunk.dst, chunk.src, chunk.srcByteSize, chunk.dstMaxByteSize);
+					K_PIX_END_EVENT();
+				}
+			});
+		}
+
+		start = std::chrono::high_resolution_clock::now();
+
+		const uint64_t numChunks = GetCompressedBinaryDataNumChunks(compressionBuffer);
+		//dataChunksToProcess.reserve(numChunks);
+
+		struct Userdata
+		{
+			void * pBaseDstChunkData;
+			std::queue<DataChunkToProcess> & dataChunksToProcess;
+		};
+
+		Userdata userdata = { decompressionBuffer, dataChunksToProcess };
+		const auto chunkDecompressionFunc = [](unsigned char const * pSrcChunkData, uint32_t srcChunkByteSize, uint64_t dstByteOffset, uint32_t dstChunkByteSize, void * pUserdata)
+		{
+			Userdata const & userdata = *(Userdata const *)pUserdata;
+			unsigned char * pDstChunkData = (unsigned char*)userdata.pBaseDstChunkData + dstByteOffset;
+			userdata.dataChunksToProcess.push({pDstChunkData, pSrcChunkData, srcChunkByteSize, dstChunkByteSize});
+		};
+
+		K_PIX_BEGIN_EVENT(0xFF00FFFF, "Prepare chunks - parallel");
+		const uint64_t uncompressedBinaryDataByteSize2 = UncompressedBinaryData(compressionBuffer, compressedBinaryDataByteSize, chunkDecompressionFunc, &userdata);
+		K_PIX_END_EVENT();
+
+		#if 0
+		while(!dataChunksToProcess.empty())
+		{
+			DataChunkToProcess const & chunk = dataChunksToProcess.front();
+			Uncompress(chunk.dst, chunk.src, chunk.srcByteSize, chunk.dstMaxByteSize);
+			dataChunksToProcess.pop();
+		}
+		#else
+		// Notify workers to start working
+		{
+			std::unique_lock<std::mutex> lock(queueMutex);
+			bReady = true;
+		}
+		queueCV.notify_all();
+		#endif
+
+		// Waits for workers to finish
+		while(true)
+		{
+			bool bProcessingDone;
+			{
+				std::unique_lock<std::mutex> lock(queueMutex);
+				if(bProcessingDone = dataChunksToProcess.empty())
+				{
+					bKillThreads = true;
+					queueCV.notify_all();
+				}
+			}
+			
+			if(bProcessingDone)
+				break;
+
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+
+		stop = std::chrono::high_resolution_clock::now();
+		duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+		duration_ms = duration.count() / 1000.0;
+		printf("Decompression time: %fms - [parallel]\n", duration_ms);
+
+		for(std::thread & w : workers)
+			w.join();
+
+		assert(uncompressedBinaryDataByteSize2 == uncompressedBinaryDataByteSize);
+		assert(uncompressedBinaryDataByteSize2 == srcDataByteSize);
+
+		// TODO: try to notify threads while main thread queue jobs
+
+		uint64_t const * uncompressedData = (uint64_t const *)decompressionBuffer;
+		int cmp = memcmp(srcData, uncompressedData, srcDataByteSize);
+		if(cmp != 0)
+		{
+			fprintf(stderr, "Error while decompressing: uncompressedData != srcData [parallel]\n");
+		}
+	}
+	K_PIX_END_EVENT();
+
+	// Memcpy
+	{
+		const auto start = std::chrono::high_resolution_clock::now();
+		memcpy(decompressionBuffer, srcData, srcDataByteSize);
+		const auto stop = std::chrono::high_resolution_clock::now();
+		const auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+		const double duration_ms = duration.count() / 1000.0;
+		printf("Decompression time: %fms - [memcpy]\n", duration_ms);
 	}
 
 	free(srcData);
 	free(compressionBuffer);
 	free(decompressionBuffer);
+
+	K_PIX_END_EVENT();
+
+	#if ENABLE_PIX_RUNTIME
+	PIXEndCapture(false);
+
+	if(!FreeLibrary(pixModule))
+		fprintf(stderr, "Failed to free PIX library\n");
+	#endif
 
 	return 0;
 }
