@@ -1,4 +1,6 @@
 #include <cuda.h>
+#include <cuda_runtime.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include <stdio.h>
 #include <mutex>
@@ -11,6 +13,9 @@
 
 #undef ENABLE_PIX_RUNTIME
 #define ENABLE_PIX_RUNTIME 0
+
+#undef ENABLE_NVTX
+#define ENABLE_NVTX 1
 
 #if ENABLE_PIX_RUNTIME
 #include <Windows.h>
@@ -28,7 +33,30 @@
 #define K_PIX_END_EVENT()                 K_NOOP()
 #endif
 
-#define CUDA_SAFE_CALL(x)                                   \
+#if ENABLE_NVTX
+#define K_NVTX_RANGE_PUSH(colorARGB, str) \
+do \
+{ \
+	nvtxEventAttributes_t eventAttrib = {0}; \
+	eventAttrib.version = NVTX_VERSION; \
+	eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE; \
+	eventAttrib.colorType = NVTX_COLOR_ARGB; \
+	eventAttrib.color = colorARGB; \
+	eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII; \
+	eventAttrib.message.ascii = str; \
+	nvtxRangePushEx(&eventAttrib); \
+} while(0)
+
+#define K_NVTX_RANGE_POP() nvtxRangePop()
+#else
+#define K_NVTX_RANGE_PUSH(colorARGB, str) K_NOOP()
+#define K_NVTX_RANGE_POP()                K_NOOP()
+#endif
+
+#define K_PUSH_PROFILING_MARKER(colorARGB, str) K_PIX_BEGIN_EVENT(colorARGB, str); K_NVTX_RANGE_PUSH(colorARGB, str)
+#define K_POP_PROFILING_MARKER()                K_PIX_END_EVENT(); K_NVTX_RANGE_POP()
+
+#define CUDA_DRIVER_CHECK_CALL(x)                           \
 	do {                                                    \
 		CUresult result = x;                                \
 		if(result != CUDA_SUCCESS) {                        \
@@ -40,6 +68,17 @@
 			exit(1);                                        \
 		}                                                   \
 	} while(0)
+
+#define CUDA_CHECK_CALL(call)                       \
+  do {                                              \
+	cudaError_t err = call;                         \
+	if(err != cudaSuccess) {                        \
+	  fprintf(stderr, "CUDA error at %s %d: %s\n",  \
+		 __FILE__, __LINE__,                        \
+		 cudaGetErrorString(err));                  \
+	  exit(EXIT_FAILURE);                           \
+	}                                               \
+  } while (0)
 
 
 template <size_t N>
@@ -220,12 +259,92 @@ ProcessMemoryInfo MeasureFuncMemoryUsage(Func && f)
 	return GetCurrentProcessMemoryInfo() - prevProcessMemInfo;
 }
 
+template <typename Func>
+double MeasureFuncTime(Func && f)
+{
+	const auto start = std::chrono::high_resolution_clock::now();
+	f();
+	const auto stop = std::chrono::high_resolution_clock::now();
+	const auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+	const double duration_ms = duration.count() / 1000.0;
+	return duration_ms;
+}
 
+template <typename Func>
+double MeasureAndPrintFuncTime(char const * label, Func && f)
+{
+	const double duration_ms = MeasureFuncTime(std::forward<Func>(f));
+	printf("%s: %fms\n", label, duration_ms);
+	return duration_ms;
+}
+
+
+// https://github.com/kirksaunders/barrier/blob/master/barrier.hpp
+// https://stackoverflow.com/questions/24465533/implementing-boostbarrier-in-c11/
+// https://codereview.stackexchange.com/questions/243519/barrier-implementation-in-c
+// https://stackoverflow.com/questions/17101922/do-i-have-to-acquire-lock-before-calling-condition-variable-notify-one
+// https://stackoverflow.com/questions/26190853/why-does-the-boost-library-use-an-m-generation-variable-in-its-implementation-of
+class Barrier
+{
+	public:
+		// Construct barrier for use with num threads.
+		Barrier(std::size_t num)
+			: num_threads(num),
+				wait_count(0),
+				instance(0),
+				mut(),
+				cv()
+		{
+
+		}
+
+		// disable copying of barrier
+		Barrier(const Barrier&) = delete;
+		Barrier& operator =(const Barrier&) = delete;
+
+		// This function blocks the calling thread until
+		// all threads (specified by num_threads) have
+		// called it. Blocking is achieved using a
+		// call to condition_variable.wait().
+		void wait()
+		{
+			std::unique_lock<std::mutex> lock(mut); // acquire lock
+			std::size_t inst = instance; // store current instance for comparison
+											// in predicate
+
+			if(++wait_count == num_threads) // all threads reached barrier
+			{
+				wait_count = 0; // reset wait_count
+				instance++; // increment instance for next use of barrier and to
+							// pass condition variable predicate
+				cv.notify_all();
+			}
+			else // not all threads have reached barrier
+			{
+				cv.wait(lock, [this, &inst]() { return instance != inst; });
+				// NOTE: The predicate lambda here protects against spurious
+				//       wakeups of the thread. As long as this->instance is
+				//       equal to inst, the thread will not wake.
+				//       this->instance will only increment when all threads
+				//       have reached the barrier and are ready to be unblocked.
+			}
+		}
+	private:
+		std::size_t num_threads; // number of threads using barrier
+		std::size_t wait_count; // counter to keep track of waiting threads
+		std::size_t instance; // counter to keep track of barrier use count
+		std::mutex mut; // mutex used to protect resources
+		std::condition_variable cv; // condition variable used to block threads
+};
+
+
+int PinnedHostMemoryTests();
 int BinaryFormatTests();
 int MemoryMapTests();
 
 int main()
 {
+	//return PinnedHostMemoryTests();
 	return BinaryFormatTests();
 	// return MemoryMapTests();
 }
@@ -245,7 +364,12 @@ int main()
 // Inspired by https://github.com/raysan5/rres
 struct BinDataHeader
 {
-	enum { MAX_CHUNKS = 1u << 16 };
+	enum
+	{
+		MAX_CHUNKS = 1u << 16,
+		MIN_CHUNKS_UNCOMPRESSED_BYTE_SIZE = 4096, // 4Ko
+		MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE = 16 * 1024 * 1024 // 64Mo -> up to MAX_CHUNKS * MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE bytes = 65536 * 16Mo = 1To
+	};
 
 	// File identifier
 	union
@@ -280,13 +404,15 @@ uint32_t GetChunkUncompressedByteSize(uint64_t srcByteSize)
 {
 	// Constraint: must generate at most BinDataHeader::MAX_CHUNKS chunks
 	const uint64_t maxNumChunks = BinDataHeader::MAX_CHUNKS;
-	uint32_t size = 4ull * 1024 * 1024; // 4Mo // TODO: tune this (make it dependenton srcByteSize?)
+	uint32_t size = 4ull * 1024 * 1024; // 4Mo // TODO: tune this (make it dependent on srcByteSize?)
 	uint64_t numChunks = (srcByteSize + size - 1) / size;
 	while(numChunks > maxNumChunks)
 	{
 		size <<= 1;
 		numChunks = (srcByteSize + size - 1) / size;
 	}
+	assert(size >= BinDataHeader::MIN_CHUNKS_UNCOMPRESSED_BYTE_SIZE);
+	assert(size <= BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE);
 	return size;
 }
 
@@ -307,16 +433,30 @@ uint64_t Compress(void * dst, void const * src, uint64_t srcByteSize, uint64_t d
 	return LZ4_compress_default((char const *)src, (char *)dst, (int)srcByteSize, (int)dstMaxByteSize);
 	#else
 	// Dummy compression test function
-	uint64_t const * iSrc = (uint64_t const *)src;
-	uint32_t * iDst = (uint32_t *)dst;
+	#if 1
+		uint64_t const * iSrc = (uint64_t const *)src;
+		uint32_t * iDst = (uint32_t *)dst;
 
-	const uint64_t n = srcByteSize / sizeof(uint64_t);
-	for(uint64_t i = 0; i < n; ++i)
-	{
-		iDst[i] = (uint32_t)iSrc[i];
-	}
+		const uint64_t n = srcByteSize / sizeof(uint64_t);
+		for(uint64_t i = 0; i < n; ++i)
+		{
+			iDst[i] = (uint32_t)iSrc[i];
+		}
 
-	return srcByteSize / 2;
+		return srcByteSize / 2;
+	#else
+		uint64_t const * iSrc = (uint64_t const *)src;
+		uint64_t * iDst = (uint64_t *)dst;
+
+		const uint64_t n = srcByteSize / sizeof(uint64_t);
+		for(uint64_t i = 0; i < n; ++i)
+		{
+			iDst[i] = iSrc[i];
+		}
+
+		return srcByteSize;
+	#endif
+
 	#endif
 }
 
@@ -326,16 +466,29 @@ uint64_t Uncompress(void * dst, void const * src, uint64_t srcByteSize, uint64_t
 	return LZ4_decompress_safe((char const *)src, (char *)dst, srcByteSize, dstMaxByteSize);
 	#else
 	// Dummy decompression test function
-	uint32_t const * iSrc = (uint32_t const *)src;
-	uint64_t * iDst = (uint64_t *)dst;
+	#if 1
+		uint32_t const * iSrc = (uint32_t const *)src;
+		uint64_t * iDst = (uint64_t *)dst;
 
-	const uint64_t n = srcByteSize / sizeof(uint32_t);
-	for(uint64_t i = 0; i < n; ++i)
-	{
-		iDst[i] = (uint64_t)iSrc[i];
-	}
+		const uint64_t n = srcByteSize / sizeof(uint32_t);
+		for(uint64_t i = 0; i < n; ++i)
+		{
+			iDst[i] = (uint64_t)iSrc[i];
+		}
 
-	return srcByteSize * 2;
+		return srcByteSize * 2;
+	#else
+		uint64_t const * iSrc = (uint64_t const *)src;
+		uint64_t * iDst = (uint64_t *)dst;
+
+		const uint64_t n = srcByteSize / sizeof(uint64_t);
+		for(uint64_t i = 0; i < n; ++i)
+		{
+			iDst[i] = iSrc[i];
+		}
+
+		return srcByteSize;
+	#endif
 	#endif
 }
 
@@ -512,6 +665,154 @@ void PrintCompressedBinaryDataInfo(void * compressedData)
 	printf("\tChunk uncompressed byte size: %s\n", HumanReadableByteSizeStr(header.chunkUncompressedByteSize).c_str());
 }
 
+
+// https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#asynchronous-concurrent-execution
+// https://www.docenti.unina.it/webdocenti-be/allegati/materiale-didattico/517066
+/*
+Two commands from different streams cannot run concurrently if one of the following operations is issued
+in-between them by the host thread:
+	- A page-locked host memory allocation,
+	- A device memory allocation,
+	- A device memory set,
+	- A device <-> device memory copy,
+	- A CUDA command to Stream 0 (including kernel launches and host <-> device memory copies that do
+	  not specify any stream parameter)
+	- A switch between the L1/shared memory configurations
+
+	All GPU calls (memcpy, kernel execution, etc.) are placed into default stream unless otherwise specified
+	
+	Stream 0 is special:
+		- Synchronous with all streams
+		Meaning: Things done in Stream 0 cannot overlap with other streams
+		- Streams with non-blocking flag are an exception:
+			cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking)
+*/
+
+int PinnedHostMemoryTests()
+{
+	if(0)
+	{
+		const uint64_t byteSize = 8ull * 1024 * 1024 * 1024;
+		unsigned char * pinnedHostMemory; 
+		CUDA_CHECK_CALL(cudaHostAlloc(&pinnedHostMemory, byteSize, cudaHostAllocDefault));
+
+		memset(pinnedHostMemory, 0xAB, byteSize);
+		memset(pinnedHostMemory, 0xCD, byteSize);
+
+
+		for(uint64_t i = 0; i < byteSize; ++i)
+		{
+			if(pinnedHostMemory[i] != 0xCD)
+			{
+				fprintf(stderr, "Incorrect value at %llu: 0x%x\n", i, (uint32_t)pinnedHostMemory[i]);
+			}
+		}
+		CUDA_CHECK_CALL(cudaFreeHost(pinnedHostMemory));
+	}
+
+	if(0)
+	{
+		const uint64_t byteSize = 8ull * 1024 * 1024 * 1024;
+
+		unsigned char * pinnedHostMemory; 
+		CUDA_CHECK_CALL(cudaHostAlloc(&pinnedHostMemory, byteSize, cudaHostAllocDefault));
+
+		unsigned char * hostMemory = (unsigned char *)malloc(byteSize);
+
+		void * deviceMemory;
+		CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, byteSize));
+
+		cudaStream_t stream;
+		CUDA_CHECK_CALL(cudaStreamCreate(&stream));
+
+		memset(pinnedHostMemory, 0xAB, byteSize);
+		memset(pinnedHostMemory, 0xCD, byteSize);
+
+		CUDA_CHECK_CALL(cudaMemcpyAsync(deviceMemory, pinnedHostMemory, byteSize, cudaMemcpyHostToDevice, stream));
+		CUDA_CHECK_CALL(cudaStreamSynchronize(stream));
+
+		CUDA_CHECK_CALL(cudaMemcpy(hostMemory, deviceMemory, byteSize, cudaMemcpyDeviceToHost));
+		for(uint64_t i = 0; i < byteSize; ++i)
+		{
+			if(hostMemory[i] != 0xCD)
+			{
+				fprintf(stderr, "Incorrect value at %llu: 0x%x\n", i, (uint32_t)hostMemory[i]);
+			}
+		}
+
+		CUDA_CHECK_CALL(cudaStreamDestroy(stream));
+		CUDA_CHECK_CALL(cudaFree(deviceMemory));
+		free(hostMemory);
+		CUDA_CHECK_CALL(cudaFreeHost(pinnedHostMemory));
+	}
+
+	if(1)
+	{
+		const uint32_t numChunks = 4;
+		const uint64_t chunkByteSize = 4ull * 1024ull * 1024ull; // 4MB
+		const uint64_t byteSize = numChunks * chunkByteSize;
+
+		unsigned char * deviceMemory; 
+		CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, byteSize));
+
+		const uint32_t numStreams = 2;
+		cudaStream_t memcpyStreams[numStreams];
+		for(uint32_t i = 0; i < numStreams; ++i)
+		{
+			CUDA_CHECK_CALL(cudaStreamCreate(&memcpyStreams[i]));
+		}
+
+		unsigned char * chunkStagingData[numStreams];
+		for(uint32_t i = 0; i < numStreams; ++i)
+		{
+			CUDA_CHECK_CALL(cudaHostAlloc(&chunkStagingData[i], chunkByteSize, cudaHostAllocDefault));
+		}
+
+		uint32_t currStreamIdx = 0;
+		for(uint64_t i = 0; i < numChunks; ++i)
+		{
+			CUDA_CHECK_CALL(cudaStreamSynchronize(memcpyStreams[currStreamIdx])); // Ensure previous async copy is done
+
+			unsigned char * src = chunkStagingData[currStreamIdx];
+			unsigned char * dst = deviceMemory + i * chunkByteSize;
+
+			memset(src, (currStreamIdx+1) * 0x11, chunkByteSize);
+			memset(src, 0xAB, chunkByteSize);
+
+			CUDA_CHECK_CALL(cudaMemcpyAsync(dst, src, chunkByteSize, cudaMemcpyHostToDevice, memcpyStreams[currStreamIdx])); // Not working
+
+			currStreamIdx = (currStreamIdx + 1) % numStreams;
+		}
+
+		for(uint32_t i = 0; i < numStreams; ++i)
+		{
+			CUDA_CHECK_CALL(cudaStreamSynchronize(memcpyStreams[i])); // Ensure async copy is done
+			CUDA_CHECK_CALL(cudaStreamDestroy(memcpyStreams[i]));;
+		}
+
+		for(uint32_t i = 0; i < numStreams; ++i)
+		{
+			CUDA_CHECK_CALL(cudaFreeHost(chunkStagingData[i]));
+		}
+
+		unsigned char * hostMemory = (unsigned char *)malloc(byteSize);
+		CUDA_CHECK_CALL(cudaMemcpy(hostMemory, deviceMemory, byteSize, cudaMemcpyDeviceToHost));
+
+		for(uint64_t i = 0; i < byteSize; ++i)
+		{
+			if(hostMemory[i] != 0xAB)
+			{
+				printf("Incorrect value %llu: %X\n", i, (uint32_t)hostMemory[i]);
+			}
+		}
+
+		CUDA_CHECK_CALL(cudaFree(deviceMemory));
+	}
+
+	return 0;
+}
+
+// https://learn.microsoft.com/en-us/windows-hardware/drivers/display/device-paging-queues
 int BinaryFormatTests()
 {
 	#if ENABLE_PIX_RUNTIME
@@ -548,9 +849,9 @@ int BinaryFormatTests()
 	PIXBeginCapture(PIX_CAPTURE_TIMING, &params);
 	#endif
 
-	K_PIX_BEGIN_EVENT(0xFFFFFFFF, "BinaryFormatTests");
+	K_PUSH_PROFILING_MARKER(0xFFFFFFFF, "BinaryFormatTests");
 
-	K_PIX_BEGIN_EVENT(0xFFFF0000, "Init data");
+	K_PUSH_PROFILING_MARKER(0xFFFF0000, "Init data");
 
 	const uint64_t N = (1ull * 1024 * 1024 * 1024) / sizeof(uint64_t);
 	const uint64_t srcDataByteSize = N * sizeof(uint64_t);
@@ -558,16 +859,16 @@ int BinaryFormatTests()
 	for(uint64_t i = 0; i < N; ++i)
 		srcData[i] = i;
 
-	K_PIX_END_EVENT();
+	K_POP_PROFILING_MARKER();
 
 	K_PIX_BEGIN_EVENT(0xFFFF8800, "Allocate compression buffer");
 
 	const uint64_t compressedBinaryDataByteSizeUpperBound = GetCompressedBinaryDataByteSizeUpperBound(srcDataByteSize);
 	void * compressionBuffer = malloc(compressedBinaryDataByteSizeUpperBound);
 	
-	K_PIX_END_EVENT();
+	K_POP_PROFILING_MARKER();
 
-	K_PIX_BEGIN_EVENT(0xFFFFFF00, "Compress data");
+	K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Compress data");
 
 	auto start = std::chrono::high_resolution_clock::now();
 	const uint64_t compressedBinaryDataByteSize = CompressedBinaryData(compressionBuffer, srcData, srcDataByteSize, compressedBinaryDataByteSizeUpperBound);
@@ -581,49 +882,93 @@ int BinaryFormatTests()
 	printf("Compression ratio: %f%%\n", double(compressedBinaryDataByteSize)/srcDataByteSize * 100.0);
 	PrintCompressedBinaryDataInfo(compressionBuffer);
 	
-	K_PIX_END_EVENT();
+	K_POP_PROFILING_MARKER();
 
 	const uint64_t uncompressedBinaryDataByteSize = GetUncompressedBinaryDataByteSize(compressionBuffer);
 	assert(uncompressedBinaryDataByteSize == srcDataByteSize);
 
 	void * decompressionBuffer = malloc(uncompressedBinaryDataByteSize);
 
-	// Standard
-	K_PIX_BEGIN_EVENT(0xFF00FF00, "Uncompress data - standard");
+	const auto ValidateDecompressionData = [srcData, srcDataByteSize](char const * label, void * decompressionBuffer)
 	{
-		memset(decompressionBuffer, 0xFF, uncompressedBinaryDataByteSize);
-
-		start = std::chrono::high_resolution_clock::now();
-		const uint64_t uncompressedBinaryDataByteSize2 = UncompressedBinaryData(decompressionBuffer, compressionBuffer, compressedBinaryDataByteSize, uncompressedBinaryDataByteSize);
-		stop = std::chrono::high_resolution_clock::now();
-		duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
-		duration_ms = duration.count() / 1000.0;
-
-		printf("Decompression time: %fms - [standard]\n", duration_ms);
-
-		assert(uncompressedBinaryDataByteSize2 == uncompressedBinaryDataByteSize);
-		assert(uncompressedBinaryDataByteSize2 == srcDataByteSize);
-
 		uint64_t const * uncompressedData = (uint64_t const *)decompressionBuffer;
 		int cmp = memcmp(srcData, uncompressedData, srcDataByteSize);
 		if(cmp != 0)
 		{
-			fprintf(stderr, "Error while decompressing: uncompressedData != srcData [standard]\n");
+			fprintf(stderr, "Error while decompressing: uncompressedData != srcData [%s]\n", label);
 		}
-	}
-	K_PIX_END_EVENT();
+	};
 
-	// Parallel
-	K_PIX_BEGIN_EVENT(0xFF0000FF, "Uncompress data - parallel");
+	// Single-thread - decompress into local buffer + upload to CUDA buffer
+	if(1)
 	{
+		K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Device memory - alloc");
+		void * deviceMemory = nullptr;
+		CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, srcDataByteSize));
+		K_POP_PROFILING_MARKER();
+
+		uint64_t uncompressedBinaryDataByteSize2 = 0;
+
+		double memsetHostMemoryDuration_ms;
+		double decompressionDuration_ms;
+		double memcpyHostToDevice_ms;
+		MeasureAndPrintFuncTime("Single-thread decompression", [&]()
+		{
+			memsetHostMemoryDuration_ms = MeasureFuncTime([&]()
+			{
+				K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Memset host data");
+				memset(decompressionBuffer, 0xFF, uncompressedBinaryDataByteSize);
+				K_POP_PROFILING_MARKER();
+			});
+
+			decompressionDuration_ms = MeasureFuncTime([&]()
+			{
+				K_PUSH_PROFILING_MARKER(0xFF00FF00, "Uncompress data - standard");
+				uncompressedBinaryDataByteSize2 = UncompressedBinaryData(decompressionBuffer, compressionBuffer, compressedBinaryDataByteSize, uncompressedBinaryDataByteSize);
+				K_POP_PROFILING_MARKER();
+			});
+			
+			memcpyHostToDevice_ms = MeasureFuncTime([&]()
+			{
+				K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Memcpy host to device");
+				CUDA_CHECK_CALL(cudaMemcpy(deviceMemory, decompressionBuffer, srcDataByteSize, cudaMemcpyHostToDevice));
+				K_POP_PROFILING_MARKER();
+			});
+		});
+		printf("  Memset host memory: %fms\n", memsetHostMemoryDuration_ms);
+		printf("  Decompression: %fms\n", decompressionDuration_ms);
+		printf("  Memcpy host -> device: %fms (bandwidth: %s/s)\n", memcpyHostToDevice_ms, HumanReadableByteSizeStr(srcDataByteSize / (memcpyHostToDevice_ms / 1000.0)).c_str());
+
+		assert(uncompressedBinaryDataByteSize2 == uncompressedBinaryDataByteSize);
+		assert(uncompressedBinaryDataByteSize2 == srcDataByteSize);
+
+		ValidateDecompressionData("Single-thread", decompressionBuffer);
+
+		K_PUSH_PROFILING_MARKER(0xFF0000FF, "Device memory - free");
+		CUDA_CHECK_CALL(cudaFree(deviceMemory));
+		K_POP_PROFILING_MARKER();
+	}
+
+	// Parallel - decompress into local buffer + upload to CUDA buffer
+	if(1)
+	{
+		#define K_HOST_ALLOC 1
+
+		K_PUSH_PROFILING_MARKER(0xFF0000FF, "Uncompress data - parallel - CUDA");
 		memset(decompressionBuffer, 0xFF, uncompressedBinaryDataByteSize);
+
+		//CUdevice cuDevice;
+		//CUcontext context;
+		//CUDA_DRIVER_CHECK_CALL(cuInit(0));
+		//CUDA_DRIVER_CHECK_CALL(cuDeviceGet(&cuDevice, 0));
+		//CUDA_DRIVER_CHECK_CALL(cuCtxCreate(&context, 0, cuDevice));
 
 		struct DataChunkToProcess
 		{
 			unsigned char * dst;
 			unsigned char const * src;
 			uint32_t srcByteSize;
-			uint32_t dstMaxByteSize;
+			uint32_t dstByteSize;
 		};
 
 		// TODO: use SPMC queue?
@@ -631,35 +976,151 @@ int BinaryFormatTests()
 
 		std::mutex queueMutex;
 		std::condition_variable queueCV;
+		std::condition_variable workersCleanupCV;
 		bool bReady = false;
 		bool bKillThreads = false;
 
 		const int numThreads = std::thread::hardware_concurrency() - 2;
 		printf("Num threads: %d\n", numThreads);
 		std::vector<std::thread> workers(numThreads);
+
+		Barrier barrier(numThreads + 1);
+		Barrier & initializationBarrier = barrier;
+		Barrier & processingDoneBarrier = barrier;
+
 		for(int i = 0; i < numThreads; ++i)
 		{
-			workers[i] = std::thread([&, i]()
+			static constexpr uint32_t kNumBufferedChunks = 8;
+
+			// Add another indirection so that decompression can happen during cudaMemcpyAsync of **current** stream
+			// -> local buffer in (pageable) host memory and staging buffer in pinned host memory in write combine mode
+			// into which we memcpy the result of the decompression (after the cudaStreamSynchronize) and that is the
+			// source of the cudaMemcpyAsync
+			#define USE_INTERMEDIATE_STAGING_BUFFER 0 // Slower because memory transfer from host to device is not the bottleneck here
+			#define USE_WRITE_COMBINED_MEMORY 0 // Note: **Really** slow when enabled w/o USE_INTERMEDIATE_STAGING_BUFFER because the LZ4 decompression routine might read into the decompression buffer (in WC memory)
+
+			#if USE_WRITE_COMBINED_MEMORY
+			const unsigned int hostAllocFlags = cudaHostAllocWriteCombined;
+			#else
+			const unsigned int hostAllocFlags = cudaHostAllocDefault;
+			#endif
+
+			const uint64_t tmpChunkStorageByteSize = kNumBufferedChunks * BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE;
+			unsigned char * tmpChunkPinnedHostMemoryStorage;
+
+			// https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#asynchronous-and-overlapping-transfers-with-computation
+			CUDA_CHECK_CALL(cudaHostAlloc(&tmpChunkPinnedHostMemoryStorage, tmpChunkStorageByteSize, hostAllocFlags));
+			CUDA_CHECK_CALL(cudaMemset(tmpChunkPinnedHostMemoryStorage, 0x00, tmpChunkStorageByteSize)); // Warm up pinned memory ("MakeResident" + "CommitVirtualAddressRange" Paging Queue Packets on the "UMD Paging queue" in NVIDIA NSight Systems)
+
+			unsigned char * tmpChunkHostStorage = nullptr;
+			#if USE_INTERMEDIATE_STAGING_BUFFER
+			tmpChunkHostStorage = (unsigned char *)malloc(tmpChunkStorageByteSize);
+			#endif
+
+			workers[i] = std::thread([&, tmpChunkPinnedHostMemoryStorage, tmpChunkHostStorage]()
 			{
+				#if USE_INTERMEDIATE_STAGING_BUFFER
+				unsigned char * tmpChunkHostBuffer[kNumBufferedChunks];
+				#endif
+				unsigned char * tmpChunkPinnedHostMemoryBuffer[kNumBufferedChunks];
+				for(uint32_t j = 0; j < kNumBufferedChunks; ++j)
+				{
+					#if USE_INTERMEDIATE_STAGING_BUFFER
+					tmpChunkHostBuffer[j] = tmpChunkHostStorage + j * BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE;
+					#endif
+
+					tmpChunkPinnedHostMemoryBuffer[j] = tmpChunkPinnedHostMemoryStorage + j * BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE;
+				}
+
+				cudaStream_t memcpyStreams[kNumBufferedChunks];
+				for(int j = 0; j < kNumBufferedChunks; ++j)
+				{
+					CUDA_CHECK_CALL(cudaStreamCreate(&memcpyStreams[j]));
+					//CUDA_CHECK_CALL(cudaEventCreateWithFlags(&memcpyEvents[j], cudaEventBlockingSync|cudaEventDisableTiming));
+				}
+
+				uint32_t currBuffer = 0;
+				bool bFirstIteration = true;
+
+				uint32_t iter = 0;
+
+				initializationBarrier.wait(); // Wait for initialization of all workers and main thread
+
 				while(true)
 				{
+					K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Uncompress chunk - wait");
 					std::unique_lock<std::mutex> lock(queueMutex);
-					queueCV.wait(lock, [&]{ return (bReady && !dataChunksToProcess.empty()) || bKillThreads; });
+					queueCV.wait(lock, [&]{ return (/*bReady && */!dataChunksToProcess.empty()) || bKillThreads; });
+					K_POP_PROFILING_MARKER();
 
 					if(bKillThreads)
 						break;
 
+					K_PUSH_PROFILING_MARKER(0xFF0077FF, "Uncompress chunk - pop item");
 					DataChunkToProcess chunk = dataChunksToProcess.front();
 					dataChunksToProcess.pop();
 					lock.unlock();
+					K_POP_PROFILING_MARKER();
 
-					K_PIX_BEGIN_EVENT(0xFF00FFFF, "Uncompress chunk - parallel");
-					Uncompress(chunk.dst, chunk.src, chunk.srcByteSize, chunk.dstMaxByteSize);
-					K_PIX_END_EVENT();
+					const auto UncompressLambda = [&](unsigned char * pUncompressedChunkDataStagingBuffer)
+					{
+						K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Uncompress chunk - parallel - CUDA");
+						assert(chunk.dstByteSize <= BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE);
+						Uncompress(pUncompressedChunkDataStagingBuffer, chunk.src, chunk.srcByteSize, chunk.dstByteSize);
+						K_POP_PROFILING_MARKER();
+					};
+
+					#if USE_INTERMEDIATE_STAGING_BUFFER
+					UncompressLambda(tmpChunkHostBuffer[currBuffer]);
+					#endif
+
+					if(!bFirstIteration)
+					{
+						K_PUSH_PROFILING_MARKER(0xFF0000FF, "cudaStreamSynchronize");
+						CUDA_CHECK_CALL(cudaStreamSynchronize(memcpyStreams[currBuffer])); // Ensure async copy is done
+						K_POP_PROFILING_MARKER();
+					}
+
+					#if USE_INTERMEDIATE_STAGING_BUFFER
+					memcpy(tmpChunkPinnedHostMemoryBuffer[currBuffer], tmpChunkHostBuffer[currBuffer], chunk.dstByteSize);
+					// TODO: try cudaMemcpyAsync -> but would need to synchronize before uncompression in tmpChunkHostBuffer
+					#else
+					UncompressLambda(tmpChunkPinnedHostMemoryBuffer[currBuffer]);
+					#endif
+
+					K_PUSH_PROFILING_MARKER(0xFF0000FF, "cudaMemcpyAsync");
+					CUDA_CHECK_CALL(cudaMemcpyAsync(chunk.dst, tmpChunkPinnedHostMemoryBuffer[currBuffer], chunk.dstByteSize, cudaMemcpyHostToDevice, memcpyStreams[currBuffer]));
+					//CUDA_CHECK_CALL(cudaMemcpy(chunk.dst, tmpChunkPinnedHostMemoryBuffer[currBuffer], chunk.dstByteSize, cudaMemcpyHostToDevice));
+					K_POP_PROFILING_MARKER();
+
+					currBuffer = (currBuffer + 1) % kNumBufferedChunks;
+					if(bFirstIteration && currBuffer == kNumBufferedChunks-1)
+						bFirstIteration = false;
+
+					++iter;
 				}
+
+				for(int j = 0; j < kNumBufferedChunks; ++j)
+				{
+					CUDA_CHECK_CALL(cudaStreamSynchronize(memcpyStreams[j])); // Ensure async copy is done
+				}
+
+				processingDoneBarrier.wait(); // Wait for workers exiting their processing loop
+
+				// Clean up
+				for(int j = 0; j < kNumBufferedChunks; ++j)
+				{
+					CUDA_CHECK_CALL(cudaStreamDestroy(memcpyStreams[j]));;
+				}
+				CUDA_CHECK_CALL(cudaFreeHost(tmpChunkPinnedHostMemoryStorage));
+				free(tmpChunkHostStorage);
 			});
 		}
 
+		void * decompressionBufferDevice;
+		CUDA_CHECK_CALL(cudaMalloc(&decompressionBufferDevice, uncompressedBinaryDataByteSize));
+
+		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Parallel decompression and CUDA buffer upload");
 		start = std::chrono::high_resolution_clock::now();
 
 		const uint64_t numChunks = GetCompressedBinaryDataNumChunks(compressionBuffer);
@@ -667,21 +1128,23 @@ int BinaryFormatTests()
 
 		struct Userdata
 		{
-			void * pBaseDstChunkData;
+			void * pBaseDstChunkDataDevice;
 			std::queue<DataChunkToProcess> & dataChunksToProcess;
 		};
 
-		Userdata userdata = { decompressionBuffer, dataChunksToProcess };
+		Userdata userdata = { decompressionBufferDevice, dataChunksToProcess };
 		const auto chunkDecompressionFunc = [](unsigned char const * pSrcChunkData, uint32_t srcChunkByteSize, uint64_t dstByteOffset, uint32_t dstChunkByteSize, void * pUserdata)
 		{
 			Userdata const & userdata = *(Userdata const *)pUserdata;
-			unsigned char * pDstChunkData = (unsigned char*)userdata.pBaseDstChunkData + dstByteOffset;
+			unsigned char * pDstChunkData = (unsigned char*)userdata.pBaseDstChunkDataDevice + dstByteOffset;
 			userdata.dataChunksToProcess.push({pDstChunkData, pSrcChunkData, srcChunkByteSize, dstChunkByteSize});
 		};
 
-		K_PIX_BEGIN_EVENT(0xFF00FFFF, "Prepare chunks - parallel");
+		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Prepare chunks - parallel - CUDA");
 		const uint64_t uncompressedBinaryDataByteSize2 = UncompressedBinaryData(compressionBuffer, compressedBinaryDataByteSize, chunkDecompressionFunc, &userdata);
-		K_PIX_END_EVENT();
+		K_POP_PROFILING_MARKER();
+
+		initializationBarrier.wait(); // Wait for workers initialization (TODO: add thread-safe queue to enqueue and process in parallel)
 
 		#if 0
 		while(!dataChunksToProcess.empty())
@@ -692,14 +1155,16 @@ int BinaryFormatTests()
 		}
 		#else
 		// Notify workers to start working
-		{
-			std::unique_lock<std::mutex> lock(queueMutex);
-			bReady = true;
-		}
+		//{
+		//	std::unique_lock<std::mutex> lock(queueMutex);
+		//	bReady = true;
+		//}
 		queueCV.notify_all();
 		#endif
 
 		// Waits for workers to finish
+		// TODO: find a better way to check that workers are done
+		K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Main thread - wait for workers"); // TODO: make main thread participate as well?
 		while(true)
 		{
 			bool bProcessingDone;
@@ -715,13 +1180,18 @@ int BinaryFormatTests()
 			if(bProcessingDone)
 				break;
 
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		}
+		K_POP_PROFILING_MARKER();
+
+		processingDoneBarrier.wait(); // Wait for workers exiting their processing loop
+
+		K_POP_PROFILING_MARKER();
 
 		stop = std::chrono::high_resolution_clock::now();
 		duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
 		duration_ms = duration.count() / 1000.0;
-		printf("Decompression time: %fms - [parallel]\n", duration_ms);
+		printf("Decompression time and GPU upload time: %fms - [parallel - CUDA]\n", duration_ms);
 
 		for(std::thread & w : workers)
 			w.join();
@@ -729,32 +1199,310 @@ int BinaryFormatTests()
 		assert(uncompressedBinaryDataByteSize2 == uncompressedBinaryDataByteSize);
 		assert(uncompressedBinaryDataByteSize2 == srcDataByteSize);
 
-		// TODO: try to notify threads while main thread queue jobs
+		CUDA_CHECK_CALL(cudaMemcpy(decompressionBuffer, decompressionBufferDevice, uncompressedBinaryDataByteSize, cudaMemcpyDeviceToHost));
 
 		uint64_t const * uncompressedData = (uint64_t const *)decompressionBuffer;
-		int cmp = memcmp(srcData, uncompressedData, srcDataByteSize);
-		if(cmp != 0)
-		{
-			fprintf(stderr, "Error while decompressing: uncompressedData != srcData [parallel]\n");
-		}
-	}
-	K_PIX_END_EVENT();
 
-	// Memcpy
+		unsigned char const * uncompressedDataU8 = (unsigned char const *)decompressionBuffer;
+
+		ValidateDecompressionData("Multi-thread", decompressionBuffer);
+
+		CUDA_CHECK_CALL(cudaFree(decompressionBufferDevice));
+
+		//CUDA_DRIVER_CHECK_CALL(cuCtxDestroy(context));
+		K_POP_PROFILING_MARKER();
+	}
+
+	/*
+	   // https://stackoverflow.com/questions/49480334/where-is-pinned-memory-allocated-using-cudahostalloc
+
+		"Page-Locked Host Memory" for CUDA (and other DMA-capable external hardware like PCI-express cards) is allocated in physical memory of the Host computer. The allocation is marked as not-swappable (not-pageable) and not-movable (locked, pinned). This is similar to the action of mlock syscall "lock part or all of the calling process's virtual address space into RAM, preventing that memory from being paged to the swap area."
+
+		This allocation can be accessed by kernel virtual address space (as kernel has full view of the physical memory) and this allocation is also added to the user process virtual address space to allow process access it.
+
+		When you does ordinary malloc, actual physical memory allocation may (and will) be postponed to the first (write) access to the pages. With mlocked/pinned memory all physical pages are allocated inside locking or pinning calls (like MAP_POPULATE in mmap: "Populate (prefault) page tables for a mapping"), and physical addresses of pages will not change (no swapping, no moving, no compacting...).
+
+		CUDA docs: http://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html#group__CUDART__MEMORY_1gb65da58f444e7230d3322b6126bb4902
+
+			__host__ cudaError_t cudaHostAlloc ( void** pHost, size_t size, unsigned int  flags )
+
+			Allocates page-locked memory on the host. ...
+
+			Allocates size bytes of host memory that is page-locked and accessible to the device. The driver tracks the virtual memory ranges allocated with this function and automatically accelerates calls to functions such as cudaMemcpy(). Since the memory can be accessed directly by the device, it can be read or written with much higher bandwidth than pageable memory obtained with functions such as malloc(). Allocating excessive amounts of pinned memory may degrade system performance, since it reduces the amount of memory available to the system for paging. As a result, this function is best used sparingly to allocate staging areas for data exchange between host and device.
+
+			...
+
+			Memory allocated by this function must be freed with cudaFreeHost().
+
+		Pinned and not-pinned memory compared: https://www.cs.virginia.edu/~mwb7w/cuda_support/pinned_tradeoff.html "Choosing Between Pinned and Non-Pinned Memory"
+
+			Pinned memory is memory allocated using the cudaMallocHost function, which prevents the memory from being swapped out and provides improved transfer speeds. Non-pinned memory is memory allocated using the malloc function. As described in Memory Management Overhead and Memory Transfer Overhead, pinned memory is much more expensive to allocate and deallocate but provides higher transfer throughput for large memory transfers.
+
+		CUDA forums post with advises from txbob moderator: https://devtalk.nvidia.com/default/topic/899020/does-cudamemcpyasync-require-pinned-memory-/ "Does cudaMemcpyAsync require pinned memory?"
+
+			If you want truly asynchronous behavior (e.g. overlap of copy and compute) then the memory must be pinned. If it is not pinned, there won't be any runtime errors, but the copy will not be asynchronous - it will be performed like an ordinary cudaMemcpy.
+
+			The usable size may vary by system and OS. Pinning 4GB of memory on a 64GB system on Linux should not have a significant effect on CPU performance, after the pinning operation is complete. Attempting to pin 60GB on the other hand might cause significant system responsiveness issues.
+	*/
+	if(0)
 	{
+		K_PUSH_PROFILING_MARKER(0xFFFF0000, "Host to paged-locked host memory");
+
+		K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Host to paged-locked host memory - alloc");
+		void * pagedLockedHostMemory = nullptr;
+		CUDA_CHECK_CALL(cudaHostAlloc(&pagedLockedHostMemory, uncompressedBinaryDataByteSize, cudaHostAllocDefault));
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF00FF00, "Host to paged-locked host memory - cudaMemcpy");
+		CUDA_CHECK_CALL(cudaMemcpy(pagedLockedHostMemory, srcData, uncompressedBinaryDataByteSize, cudaMemcpyHostToDevice));
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Host to paged-locked host memory - device synchronize");
+		CUDA_CHECK_CALL(cudaDeviceSynchronize());
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Host to paged-locked host memory - free");
+		CUDA_CHECK_CALL(cudaFreeHost(pagedLockedHostMemory));
+		K_POP_PROFILING_MARKER();
+
+		K_POP_PROFILING_MARKER();
+	}
+	
+	if(0)
+	{
+		K_PUSH_PROFILING_MARKER(0xFFFF0000, "Host to paged-locked host memory - async");
+
+		K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Host to paged-locked host memory - alloc");
+		void * pagedLockedHostMemory = nullptr;
+		CUDA_CHECK_CALL(cudaHostAlloc(&pagedLockedHostMemory, uncompressedBinaryDataByteSize, cudaHostAllocDefault));
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF00FF00, "Host to paged-locked host memory - cudaMemcpyAsync");
+		CUDA_CHECK_CALL(cudaMemcpyAsync(pagedLockedHostMemory, srcData, uncompressedBinaryDataByteSize, cudaMemcpyHostToDevice));
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Host to paged-locked host memory - device synchronize");
+		CUDA_CHECK_CALL(cudaDeviceSynchronize());
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Host to paged-locked host memory - free");
+		CUDA_CHECK_CALL(cudaFreeHost(pagedLockedHostMemory));
+		K_POP_PROFILING_MARKER();
+
+		K_POP_PROFILING_MARKER();
+	}
+	
+	if(0)
+	{
+		K_PUSH_PROFILING_MARKER(0xFFFF0000, "Host to device memory - async");
+
+		K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Host to device memory - alloc");
+		void * deviceMemory = nullptr;
+		CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, uncompressedBinaryDataByteSize));
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF00FF00, "Host to device memory - cudaMemcpyAsync");
+		CUDA_CHECK_CALL(cudaMemcpyAsync(deviceMemory, srcData, uncompressedBinaryDataByteSize, cudaMemcpyHostToDevice));
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Host to device memory - device synchronize");
+		CUDA_CHECK_CALL(cudaDeviceSynchronize());
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Host to device memory - free");
+		CUDA_CHECK_CALL(cudaFree(deviceMemory));
+		K_POP_PROFILING_MARKER();
+
+		K_POP_PROFILING_MARKER();
+	}
+	
+	if(0)
+	{
+		K_PUSH_PROFILING_MARKER(0xFFFF0000, "Paged-locked host to device memory");
+
+		K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Paged-locked host to device memory - alloc");
+		void * pagedLockedHostMemory = nullptr;
+		CUDA_CHECK_CALL(cudaHostAlloc(&pagedLockedHostMemory, uncompressedBinaryDataByteSize, cudaHostAllocDefault));
+		K_POP_PROFILING_MARKER();
+		
+		K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Device memory - alloc");
+		void * deviceMemory = nullptr;
+		CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, uncompressedBinaryDataByteSize));
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Paged-locked host to device memory - device synchronize");
+		CUDA_CHECK_CALL(cudaDeviceSynchronize());
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF00FF00, "Paged-locked host to device memory - cudaMemcpy");
+		CUDA_CHECK_CALL(cudaMemcpy(deviceMemory, pagedLockedHostMemory, uncompressedBinaryDataByteSize, cudaMemcpyHostToDevice));
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Paged-locked host to device memory - device synchronize");
+		CUDA_CHECK_CALL(cudaDeviceSynchronize());
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Paged-locked host to device memory - paged-locked host free");
+		CUDA_CHECK_CALL(cudaFreeHost(pagedLockedHostMemory));
+		K_POP_PROFILING_MARKER();
+		
+		K_PUSH_PROFILING_MARKER(0xFF0000FF, "Paged-locked host to device memory - device free");
+		CUDA_CHECK_CALL(cudaFree(deviceMemory));
+		K_POP_PROFILING_MARKER();
+
+		K_POP_PROFILING_MARKER();
+	}
+	
+	if(0)
+	{
+		K_PUSH_PROFILING_MARKER(0xFFFF0000, "Paged-locked host to device memory - async");
+
+		K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Paged-locked host to device memory - alloc");
+		void * pagedLockedHostMemory = nullptr;
+		CUDA_CHECK_CALL(cudaHostAlloc(&pagedLockedHostMemory, uncompressedBinaryDataByteSize, cudaHostAllocDefault));
+		K_POP_PROFILING_MARKER();
+		
+		K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Device memory - alloc");
+		void * deviceMemory = nullptr;
+		CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, uncompressedBinaryDataByteSize));
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Paged-locked host to device memory - device synchronize");
+		CUDA_CHECK_CALL(cudaDeviceSynchronize());
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF00FF00, "Paged-locked host to device memory - cudaMemcpyAsync");
+		CUDA_CHECK_CALL(cudaMemcpyAsync(deviceMemory, pagedLockedHostMemory, uncompressedBinaryDataByteSize, cudaMemcpyHostToDevice));
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Paged-locked host to device memory - device synchronize");
+		CUDA_CHECK_CALL(cudaDeviceSynchronize());
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF00FF88, "Paged-locked host to device memory - cudaMemset");
+		CUDA_CHECK_CALL(cudaMemset(pagedLockedHostMemory, 0xFF, uncompressedBinaryDataByteSize));
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF00FF88, "Paged-locked host to device memory - memset");
+		memset(pagedLockedHostMemory, 0xFF, uncompressedBinaryDataByteSize);
+		K_POP_PROFILING_MARKER();
+		
+		K_PUSH_PROFILING_MARKER(0xFF00FF88, "Paged-locked host to device memory - cudaMemcpyAsync");
+		CUDA_CHECK_CALL(cudaMemcpyAsync(deviceMemory, pagedLockedHostMemory, uncompressedBinaryDataByteSize, cudaMemcpyHostToDevice));
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Paged-locked host to device memory - device synchronize");
+		CUDA_CHECK_CALL(cudaDeviceSynchronize());
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Paged-locked host to device memory - paged-locked host free");
+		CUDA_CHECK_CALL(cudaFreeHost(pagedLockedHostMemory));
+		K_POP_PROFILING_MARKER();
+		
+		K_PUSH_PROFILING_MARKER(0xFF0000FF, "Paged-locked host to device memory - device free");
+		CUDA_CHECK_CALL(cudaFree(deviceMemory));
+		K_POP_PROFILING_MARKER();
+
+		K_POP_PROFILING_MARKER();
+	}
+
+	// Memcpy - from pageable memory
+	if(0)
+	{
+		K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Device memory - alloc");
+		void * deviceMemory = nullptr;
+		CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, srcDataByteSize));
+		K_POP_PROFILING_MARKER();
 		const auto start = std::chrono::high_resolution_clock::now();
 		memcpy(decompressionBuffer, srcData, srcDataByteSize);
+		CUDA_CHECK_CALL(cudaMemcpy(deviceMemory, decompressionBuffer, srcDataByteSize, cudaMemcpyHostToDevice));
 		const auto stop = std::chrono::high_resolution_clock::now();
 		const auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
 		const double duration_ms = duration.count() / 1000.0;
-		printf("Decompression time: %fms - [memcpy]\n", duration_ms);
+		printf("Decompression time: %fms - [memcpy pageable memory]\n", duration_ms);
+		K_PUSH_PROFILING_MARKER(0xFF0000FF, "Device memory - free");
+		CUDA_CHECK_CALL(cudaFree(deviceMemory));
+		K_POP_PROFILING_MARKER();
+	}
+
+	// Memcpy - from default pinned host memory
+	if(0)
+	{
+		K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Pinned host memory - alloc");
+		void * pinnedHostMemory = nullptr;
+		CUDA_CHECK_CALL(cudaHostAlloc(&pinnedHostMemory, srcDataByteSize, cudaHostAllocDefault));
+		K_POP_PROFILING_MARKER();
+		
+		K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Device memory - alloc");
+		void * deviceMemory = nullptr;
+		CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, srcDataByteSize));
+		K_POP_PROFILING_MARKER();
+
+		const auto start = std::chrono::high_resolution_clock::now();
+		memcpy(pinnedHostMemory, srcData, srcDataByteSize);
+		CUDA_CHECK_CALL(cudaMemcpy(deviceMemory, pinnedHostMemory, srcDataByteSize, cudaMemcpyHostToDevice));
+		const auto stop = std::chrono::high_resolution_clock::now();
+		const auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+		const double duration_ms = duration.count() / 1000.0;
+		printf("Decompression time: %fms - [memcpy pinned host memory]\n", duration_ms);
+
+		K_PUSH_PROFILING_MARKER(0xFF0000FF, "Pinned host memory - free");
+		CUDA_CHECK_CALL(cudaFreeHost(pinnedHostMemory));
+		K_POP_PROFILING_MARKER();
+		
+		K_PUSH_PROFILING_MARKER(0xFF0000FF, "Device memory - free");
+		CUDA_CHECK_CALL(cudaFree(deviceMemory));
+		K_POP_PROFILING_MARKER();
+	}
+	
+	// Memcpy - from write-combined pinned host memory
+	if(1)
+	{
+		K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Pinned host memory - alloc");
+		void * pinnedHostMemory = nullptr;
+		CUDA_CHECK_CALL(cudaHostAlloc(&pinnedHostMemory, srcDataByteSize, cudaHostAllocWriteCombined));
+		K_POP_PROFILING_MARKER();
+		
+		K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Device memory - alloc");
+		void * deviceMemory = nullptr;
+		CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, srcDataByteSize));
+		K_POP_PROFILING_MARKER();
+
+		double memcpyHostToPinnedHostMemoryDuration_ms;
+		double memcpyPinnedHostMemoryToDeviceDuration_ms;
+		MeasureAndPrintFuncTime("Memcpy - from write-combined pinned host memory", [&]()
+		{
+			memcpyHostToPinnedHostMemoryDuration_ms = MeasureFuncTime([&]()
+			{
+				K_PUSH_PROFILING_MARKER(0xFF0000FF, "Memcpy: Host -> Pinned host WC memory");
+				memcpy(pinnedHostMemory, srcData, srcDataByteSize);
+				K_POP_PROFILING_MARKER();
+			});
+
+			memcpyPinnedHostMemoryToDeviceDuration_ms = MeasureFuncTime([&]()
+			{
+				K_PUSH_PROFILING_MARKER(0xFF0000FF, "Memcpy: Pinned host WC memory -> Device");
+				CUDA_CHECK_CALL(cudaMemcpy(deviceMemory, pinnedHostMemory, srcDataByteSize, cudaMemcpyHostToDevice));
+				K_POP_PROFILING_MARKER();
+			});
+		});
+		printf("  Memcpy: host -> pinned host memory: %fms (%s/s)\n", memcpyHostToPinnedHostMemoryDuration_ms, HumanReadableByteSizeStr(srcDataByteSize / (memcpyHostToPinnedHostMemoryDuration_ms / 1000.0)).c_str());
+		printf("  Memcpy: pinned host memory -> device: %fms (%s/s)\n", memcpyPinnedHostMemoryToDeviceDuration_ms, HumanReadableByteSizeStr(srcDataByteSize / (memcpyPinnedHostMemoryToDeviceDuration_ms / 1000.0)).c_str());
+
+		K_PUSH_PROFILING_MARKER(0xFF0000FF, "Pinned host memory - free");
+		CUDA_CHECK_CALL(cudaFreeHost(pinnedHostMemory));
+		K_POP_PROFILING_MARKER();
+		
+		K_PUSH_PROFILING_MARKER(0xFF0000FF, "Device memory - free");
+		CUDA_CHECK_CALL(cudaFree(deviceMemory));
+		K_POP_PROFILING_MARKER();
 	}
 
 	free(srcData);
 	free(compressionBuffer);
 	free(decompressionBuffer);
 
-	K_PIX_END_EVENT();
+	K_POP_PROFILING_MARKER();
 
 	#if ENABLE_PIX_RUNTIME
 	PIXEndCapture(false);
@@ -1311,15 +2059,14 @@ int MemoryMapTests()
 			fprintf(stderr, "Failed to free PIX library\n");
 		#endif
 	}
-	
 
 
 	#if 0
 	CUdevice cuDevice;
 	CUcontext context;
-	CUDA_SAFE_CALL(cuInit(0));
-	CUDA_SAFE_CALL(cuDeviceGet(&cuDevice, 0));
-	CUDA_SAFE_CALL(cuCtxCreate(&context, 0, cuDevice));
+	CUDA_DRIVER_CHECK_CALL(cuInit(0));
+	CUDA_DRIVER_CHECK_CALL(cuDeviceGet(&cuDevice, 0));
+	CUDA_DRIVER_CHECK_CALL(cuCtxCreate(&context, 0, cuDevice));
 
 	std::mutex mutex;
 	std::condition_variable cv;
@@ -1331,7 +2078,7 @@ int MemoryMapTests()
 	{
 		workers[i] = std::thread([&, i]()
 		{
-			CUDA_SAFE_CALL(cuCtxSetCurrent(context));
+			CUDA_DRIVER_CHECK_CALL(cuCtxSetCurrent(context));
 
 			std::unique_lock<std::mutex> lock(mutex);
 			cv.wait(lock, [&]{ return bReady; });
@@ -1393,7 +2140,7 @@ int MemoryMapTests()
 		fprintf(stderr, "Failed to free PIX library\n");
 	#endif
 
-	CUDA_SAFE_CALL(cuCtxDestroy(context));
+	CUDA_DRIVER_CHECK_CALL(cuCtxDestroy(context));
 	#endif
 
 	return 0;
