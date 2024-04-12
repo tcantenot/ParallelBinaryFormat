@@ -988,16 +988,37 @@ int BinaryFormatTests()
 		Barrier & initializationBarrier = barrier;
 		Barrier & processingDoneBarrier = barrier;
 
+		// TODO: when using (async) memcpy to "WC pinned host memory" before copying to device memory,
+		// try to batch several decompressed chunk into a big "WC pinned host memory" and perform a single host to device
+		// copy:
+		//  WCPinnedHostMemory[N * MaxUncompressedChunkByteSize][2]
+		//  byteOffset = 0;
+		//  for i in range(N):
+		//    Uncompress(&WCPinnedHostMemory[j][byteOffset])
+		//    byteOffset += uncompressedChunkSize;
+		//  cudaMemcpyAsync(deviceMem, WCPinnedHostMemory[j][0], byteOffset, ...)
+		//  j = 1 - j;
+		// => issues: need to get contiguous blocks... => quite annoying because of parallel grabbing from work queue
+		// 
+		// ===> Actually not such a good idea... Better have bigger chunks if number of transfers is an issue
+		// and really on parallelism across workers instead of single-thread w/ streams
+		// 
 		for(int i = 0; i < numThreads; ++i)
 		{
-			static constexpr uint32_t kNumBufferedChunks = 8;
+			static constexpr uint32_t kNumBufferedChunks = 12;
 
 			// Add another indirection so that decompression can happen during cudaMemcpyAsync of **current** stream
 			// -> local buffer in (pageable) host memory and staging buffer in pinned host memory in write combine mode
 			// into which we memcpy the result of the decompression (after the cudaStreamSynchronize) and that is the
 			// source of the cudaMemcpyAsync
 			#define USE_INTERMEDIATE_STAGING_BUFFER 0 // Slower because memory transfer from host to device is not the bottleneck here
+			#define USE_INTERMEDIATE_STAGING_BUFFER_MEMCPYASYNC 0 // Not actually async (pinned host to pinned host)
 			#define USE_WRITE_COMBINED_MEMORY 0 // Note: **Really** slow when enabled w/o USE_INTERMEDIATE_STAGING_BUFFER because the LZ4 decompression routine might read into the decompression buffer (in WC memory)
+
+			#if USE_INTERMEDIATE_STAGING_BUFFER_MEMCPYASYNC
+			#undef USE_INTERMEDIATE_STAGING_BUFFER
+			#define USE_INTERMEDIATE_STAGING_BUFFER 1
+			#endif
 
 			#if USE_WRITE_COMBINED_MEMORY
 			const unsigned int hostAllocFlags = cudaHostAllocWriteCombined;
@@ -1014,7 +1035,11 @@ int BinaryFormatTests()
 
 			unsigned char * tmpChunkHostStorage = nullptr;
 			#if USE_INTERMEDIATE_STAGING_BUFFER
-			tmpChunkHostStorage = (unsigned char *)malloc(tmpChunkStorageByteSize);
+				#if USE_INTERMEDIATE_STAGING_BUFFER_MEMCPYASYNC
+				CUDA_CHECK_CALL(cudaHostAlloc(&tmpChunkHostStorage, tmpChunkStorageByteSize, cudaHostAllocDefault));
+				#else
+				tmpChunkHostStorage = (unsigned char *)malloc(tmpChunkStorageByteSize);
+				#endif
 			#endif
 
 			workers[i] = std::thread([&, tmpChunkPinnedHostMemoryStorage, tmpChunkHostStorage]()
@@ -1070,22 +1095,36 @@ int BinaryFormatTests()
 						K_POP_PROFILING_MARKER();
 					};
 
-					#if USE_INTERMEDIATE_STAGING_BUFFER
-					UncompressLambda(tmpChunkHostBuffer[currBuffer]);
-					#endif
+					#if USE_INTERMEDIATE_STAGING_BUFFER_MEMCPYASYNC
+						if(!bFirstIteration)
+						{
+							K_PUSH_PROFILING_MARKER(0xFF0000FF, "cudaStreamSynchronize");
+							CUDA_CHECK_CALL(cudaStreamSynchronize(memcpyStreams[currBuffer])); // Ensure async copy is done
+							K_POP_PROFILING_MARKER();
+						}
 
-					if(!bFirstIteration)
-					{
-						K_PUSH_PROFILING_MARKER(0xFF0000FF, "cudaStreamSynchronize");
-						CUDA_CHECK_CALL(cudaStreamSynchronize(memcpyStreams[currBuffer])); // Ensure async copy is done
+						UncompressLambda(tmpChunkHostBuffer[currBuffer]);
+						K_PUSH_PROFILING_MARKER(0xFF8822FF, "cudaMemcpyAsync: tmpHost -> pinned host memory");
+						CUDA_CHECK_CALL(cudaMemcpyAsync(tmpChunkPinnedHostMemoryBuffer[currBuffer], tmpChunkHostBuffer[currBuffer], chunk.dstByteSize, cudaMemcpyHostToHost, memcpyStreams[currBuffer]));
 						K_POP_PROFILING_MARKER();
-					}
-
-					#if USE_INTERMEDIATE_STAGING_BUFFER
-					memcpy(tmpChunkPinnedHostMemoryBuffer[currBuffer], tmpChunkHostBuffer[currBuffer], chunk.dstByteSize);
-					// TODO: try cudaMemcpyAsync -> but would need to synchronize before uncompression in tmpChunkHostBuffer
 					#else
-					UncompressLambda(tmpChunkPinnedHostMemoryBuffer[currBuffer]);
+						#if USE_INTERMEDIATE_STAGING_BUFFER
+						UncompressLambda(tmpChunkHostBuffer[currBuffer]);
+						#endif
+
+						if(!bFirstIteration)
+						{
+							K_PUSH_PROFILING_MARKER(0xFF0000FF, "cudaStreamSynchronize");
+							CUDA_CHECK_CALL(cudaStreamSynchronize(memcpyStreams[currBuffer])); // Ensure async copy is done
+							K_POP_PROFILING_MARKER();
+						}
+
+						#if USE_INTERMEDIATE_STAGING_BUFFER
+						memcpy(tmpChunkPinnedHostMemoryBuffer[currBuffer], tmpChunkHostBuffer[currBuffer], chunk.dstByteSize);
+						// TODO: try cudaMemcpyAsync -> but would need to synchronize before uncompression in tmpChunkHostBuffer
+						#else
+						UncompressLambda(tmpChunkPinnedHostMemoryBuffer[currBuffer]);
+						#endif
 					#endif
 
 					K_PUSH_PROFILING_MARKER(0xFF0000FF, "cudaMemcpyAsync");
@@ -1113,7 +1152,12 @@ int BinaryFormatTests()
 					CUDA_CHECK_CALL(cudaStreamDestroy(memcpyStreams[j]));;
 				}
 				CUDA_CHECK_CALL(cudaFreeHost(tmpChunkPinnedHostMemoryStorage));
+
+				#if USE_INTERMEDIATE_STAGING_BUFFER_MEMCPYASYNC
+				CUDA_CHECK_CALL(cudaFreeHost(tmpChunkHostStorage));
+				#else
 				free(tmpChunkHostStorage);
+				#endif
 			});
 		}
 
