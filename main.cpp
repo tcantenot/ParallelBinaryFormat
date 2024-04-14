@@ -950,7 +950,7 @@ int BinaryFormatTests()
 	}
 
 	// Parallel - decompress into local buffer + upload to CUDA buffer
-	if(1)
+	if(0)
 	{
 		K_PUSH_PROFILING_MARKER(0xFF0000FF, "Uncompress data - parallel - CUDA");
 		memset(decompressionBuffer, 0xFF, uncompressedBinaryDataByteSize);
@@ -1156,6 +1156,246 @@ int BinaryFormatTests()
 		ValidateDecompressionData("Multi-thread", decompressionBuffer);
 
 		CUDA_CHECK_CALL(cudaFree(decompressionBufferDevice));
+
+	
+	if(1)
+	{
+		K_PUSH_PROFILING_MARKER(0xFF0000FF, "Uncompress data - parallel - CUDA");
+		memset(decompressionBuffer, 0xFF, uncompressedBinaryDataByteSize);
+
+		struct DataChunkToProcess
+		{
+			unsigned char * dst;
+			unsigned char const * src;
+			uint32_t srcByteSize;
+			uint32_t dstByteSize;
+		};
+
+		// TODO: use SPMC queue?
+		std::queue<DataChunkToProcess> dataChunksToProcess;
+
+		struct DecompressionWorkspace
+		{
+			unsigned char * tmpChunkPinnedHostMemoryBuffer;
+			size_t tmpChunkPinnedHostMemoryByteSize;
+			cudaStream_t memcpyStream;
+			std::mutex tmpDecompressionBufferMutex;
+			std::condition_variable tmpDecompressionBufferCV;
+			bool bDecompressing = false;
+		};
+
+		std::mutex queueMutex;
+		std::condition_variable queueCV;
+		bool bReady = false;
+		bool bKillThreads = false;
+
+		const int numThreads = std::thread::hardware_concurrency() - 2;
+		printf("Num threads: %d\n", numThreads);
+		std::vector<std::thread> workers(numThreads);
+
+		#if 0
+		static constexpr uint32_t kNumBufferedChunks = 12;
+		const uint64_t numDecompressionWorkspace = numThreads * kNumBufferedChunks;
+		#else
+		const uint64_t maxPinnedHostMemoryByteSize = 2ull * 1024ull * 1024ull * 1024ull;
+		const uint64_t numDecompressionWorkspace = maxPinnedHostMemoryByteSize / BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE;
+		// Note: would also need to limit the number of threads if numDecompressionWorkspace < thread_pool_size * some_multiplier
+		#endif
+
+		std::vector<DecompressionWorkspace> decompressionWS(numDecompressionWorkspace);
+
+		#define USE_WRITE_COMBINED_MEMORY 0 // Note: **Really** slow because the LZ4 decompression routine read from the output buffer while decompressing
+
+		#if USE_WRITE_COMBINED_MEMORY
+		const unsigned int hostAllocFlags = cudaHostAllocWriteCombined;
+		#else
+		const unsigned int hostAllocFlags = cudaHostAllocDefault;
+		#endif
+
+		const uint64_t decompressionWSTotalByteSize = decompressionWS.size() * BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE;
+		// https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#asynchronous-and-overlapping-transfers-with-computation
+		unsigned char * decompressionWSPinnedHostMemoryStorage;
+		CUDA_CHECK_CALL(cudaHostAlloc(&decompressionWSPinnedHostMemoryStorage, decompressionWSTotalByteSize, hostAllocFlags));
+		//CUDA_CHECK_CALL(cudaMemset(decompressionWSPinnedHostMemoryStorage, 0x00, decompressionWSTotalByteSize)); // Warm up pinned memory ("MakeResident" + "CommitVirtualAddressRange" Paging Queue Packets on the "UMD Paging queue" in NVIDIA NSight Systems)
+		
+		for(size_t i = 0; i < decompressionWS.size(); ++i)
+		{
+			decompressionWS[i].tmpChunkPinnedHostMemoryBuffer = decompressionWSPinnedHostMemoryStorage + i * BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE;
+			decompressionWS[i].tmpChunkPinnedHostMemoryByteSize = BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE;
+			CUDA_CHECK_CALL(cudaStreamCreate(&decompressionWS[i].memcpyStream));
+		}
+
+		Barrier barrier(numThreads + 1);
+		Barrier & initializationBarrier = barrier;
+		Barrier & processingDoneBarrier = barrier;
+
+		std::atomic<uint32_t> decompressionWSIndex = 0;
+
+		for(int i = 0; i < numThreads; ++i)
+		{
+			workers[i] = std::thread([&]()
+			{
+				initializationBarrier.wait(); // Wait for initialization of all workers and main thread
+
+				while(true)
+				{
+					K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Uncompress chunk - wait");
+					std::unique_lock<std::mutex> lock(queueMutex);
+					queueCV.wait(lock, [&]{ return (/*bReady && */!dataChunksToProcess.empty()) || bKillThreads; });
+					K_POP_PROFILING_MARKER();
+
+					if(bKillThreads)
+						break;
+
+					K_PUSH_PROFILING_MARKER(0xFF0077FF, "Uncompress chunk - pop item");
+					DataChunkToProcess chunk = dataChunksToProcess.front();
+					dataChunksToProcess.pop();
+					lock.unlock();
+					K_POP_PROFILING_MARKER();
+
+					uint32_t index = decompressionWSIndex++;
+					index = index % decompressionWS.size();
+
+					K_PUSH_PROFILING_MARKER(0xFF885522, "DecompressionWorkspace - wait");
+					DecompressionWorkspace & decompressionWorkspace = decompressionWS[index];
+					std::unique_lock<std::mutex> decompressionWSLock(decompressionWorkspace.tmpDecompressionBufferMutex);
+					decompressionWorkspace.tmpDecompressionBufferCV.wait(decompressionWSLock, [&]{ return !decompressionWorkspace.bDecompressing; });
+					K_POP_PROFILING_MARKER();
+
+					decompressionWorkspace.bDecompressing = true;
+
+					K_PUSH_PROFILING_MARKER(0xFF0000FF, "cudaStreamSynchronize");
+					CUDA_CHECK_CALL(cudaStreamSynchronize(decompressionWorkspace.memcpyStream)); // Ensure previous async copy is done
+					K_POP_PROFILING_MARKER();
+
+					K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Uncompress chunk - parallel - CUDA");
+					assert(chunk.dstByteSize <= BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE);
+					Uncompress(decompressionWorkspace.tmpChunkPinnedHostMemoryBuffer, chunk.src, chunk.srcByteSize, chunk.dstByteSize);
+					K_POP_PROFILING_MARKER();
+
+					K_PUSH_PROFILING_MARKER(0xFF0000FF, "cudaMemcpyAsync");
+					CUDA_CHECK_CALL(cudaMemcpyAsync(chunk.dst, decompressionWorkspace.tmpChunkPinnedHostMemoryBuffer, chunk.dstByteSize, cudaMemcpyHostToDevice, decompressionWorkspace.memcpyStream));
+					//CUDA_CHECK_CALL(cudaMemcpy(chunk.dst, decompressionWorkspace.tmpChunkPinnedHostMemoryBuffer, chunk.dstByteSize, cudaMemcpyHostToDevice));
+					K_POP_PROFILING_MARKER();
+
+					K_PUSH_PROFILING_MARKER(0xFFFFFF00, "DecompressionWorkspace - unlock and notify");
+					decompressionWorkspace.bDecompressing = false;
+					decompressionWSLock.unlock();
+					decompressionWorkspace.tmpDecompressionBufferCV.notify_one();
+					K_POP_PROFILING_MARKER();
+				}
+
+				processingDoneBarrier.wait(); // Wait for workers exiting their processing loop
+			});
+		}
+
+		void * decompressionBufferDevice;
+		CUDA_CHECK_CALL(cudaMalloc(&decompressionBufferDevice, uncompressedBinaryDataByteSize));
+
+		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Parallel decompression and CUDA buffer upload");
+		start = std::chrono::high_resolution_clock::now();
+
+		const uint64_t numChunks = GetCompressedBinaryDataNumChunks(compressionBuffer);
+		//dataChunksToProcess.reserve(numChunks);
+
+		struct Userdata
+		{
+			void * pBaseDstChunkDataDevice;
+			std::queue<DataChunkToProcess> & dataChunksToProcess;
+		};
+
+		Userdata userdata = { decompressionBufferDevice, dataChunksToProcess };
+		const auto chunkDecompressionFunc = [](unsigned char const * pSrcChunkData, uint32_t srcChunkByteSize, uint64_t dstByteOffset, uint32_t dstChunkByteSize, void * pUserdata)
+		{
+			Userdata const & userdata = *(Userdata const *)pUserdata;
+			unsigned char * pDstChunkData = (unsigned char*)userdata.pBaseDstChunkDataDevice + dstByteOffset;
+			userdata.dataChunksToProcess.push({pDstChunkData, pSrcChunkData, srcChunkByteSize, dstChunkByteSize});
+		};
+
+		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Prepare chunks - parallel - CUDA");
+		const uint64_t uncompressedBinaryDataByteSize2 = UncompressedBinaryData(compressionBuffer, compressedBinaryDataByteSize, chunkDecompressionFunc, &userdata);
+		K_POP_PROFILING_MARKER();
+
+		initializationBarrier.wait(); // Wait for workers initialization (TODO: add thread-safe queue to enqueue and process in parallel)
+
+		#if 0
+		while(!dataChunksToProcess.empty())
+		{
+			DataChunkToProcess const & chunk = dataChunksToProcess.front();
+			Uncompress(chunk.dst, chunk.src, chunk.srcByteSize, chunk.dstMaxByteSize);
+			dataChunksToProcess.pop();
+		}
+		#else
+		// Notify workers to start working
+		//{
+		//	std::unique_lock<std::mutex> lock(queueMutex);
+		//	bReady = true;
+		//}
+		queueCV.notify_all();
+		#endif
+
+		// Waits for workers to finish
+		// TODO: find a better way to check that workers are done
+		K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Main thread - wait for workers"); // TODO: make main thread participate as well?
+		while(true)
+		{
+			bool bProcessingDone;
+			{
+				std::unique_lock<std::mutex> lock(queueMutex);
+				if(bProcessingDone = dataChunksToProcess.empty())
+				{
+					bKillThreads = true;
+					queueCV.notify_all();
+				}
+			}
+			
+			if(bProcessingDone)
+				break;
+
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF55FF88, "cudaDeviceSynchronize"); // TODO: make main thread participate as well?
+		CUDA_CHECK_CALL(cudaDeviceSynchronize()); // Wait for all copies to finish (TODO: try to call cudaStreamSynchronize in parallel by worker threads?)
+		K_POP_PROFILING_MARKER();
+
+		processingDoneBarrier.wait(); // Wait for workers exiting their processing loop
+
+		K_POP_PROFILING_MARKER();
+
+		stop = std::chrono::high_resolution_clock::now();
+		duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+		duration_ms = duration.count() / 1000.0;
+		printf("Decompression time and GPU upload time: %fms - [parallel - CUDA]\n", duration_ms);
+
+		K_PUSH_PROFILING_MARKER(0xFFFF7766, "Workers join");
+		for(std::thread & w : workers)
+			w.join();
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFFFFFFFF, "Validate data");
+		assert(uncompressedBinaryDataByteSize2 == uncompressedBinaryDataByteSize);
+		assert(uncompressedBinaryDataByteSize2 == srcDataByteSize);
+
+		CUDA_CHECK_CALL(cudaMemcpy(decompressionBuffer, decompressionBufferDevice, uncompressedBinaryDataByteSize, cudaMemcpyDeviceToHost));
+
+		uint64_t const * uncompressedData = (uint64_t const *)decompressionBuffer;
+
+		unsigned char const * uncompressedDataU8 = (unsigned char const *)decompressionBuffer;
+
+		ValidateDecompressionData("Multi-thread", decompressionBuffer);
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFFFF5522, "Clean up");
+		CUDA_CHECK_CALL(cudaFree(decompressionBufferDevice));
+
+		for(size_t i = 0; i < decompressionWS.size(); ++i)
+		{
+			CUDA_CHECK_CALL(cudaStreamDestroy(decompressionWS[i].memcpyStream));
+		}
+		CUDA_CHECK_CALL(cudaFreeHost(decompressionWSPinnedHostMemoryStorage));
+		K_POP_PROFILING_MARKER();
 
 		K_POP_PROFILING_MARKER();
 	}
