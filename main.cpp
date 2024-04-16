@@ -555,7 +555,7 @@ uint64_t CompressedBinaryData(void * compressedData, void const * uncompressedDa
 
 	assert(pHeader->compressedByteSize == pChunksHeaders[numChunks-1].byteOffset + pChunksHeaders[numChunks-1].compressedByteSize);
 
-	return sizeof(BinDataHeader) + pHeader->numChunks * sizeof(BinDataChunkHeader) + pHeader->compressedByteSize;
+	return sizeof(BinDataHeader) + (pHeader->numChunks+1) * sizeof(BinDataChunkHeader) + pHeader->compressedByteSize;
 
 	// Note: could be compressed in parallel but would need compression at the end since each chunk would have allocated its upperbound
 	#if 0
