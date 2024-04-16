@@ -3,6 +3,7 @@
 #include <nvtx3/nvToolsExt.h>
 
 #include <stdio.h>
+#include <future> // std::async
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -53,8 +54,27 @@ do \
 #define K_NVTX_RANGE_POP()                K_NOOP()
 #endif
 
-#define K_PUSH_PROFILING_MARKER(colorARGB, str) K_PIX_BEGIN_EVENT(colorARGB, str); K_NVTX_RANGE_PUSH(colorARGB, str)
-#define K_POP_PROFILING_MARKER()                K_PIX_END_EVENT(); K_NVTX_RANGE_POP()
+struct ScopedProfilingMarker
+{
+	ScopedProfilingMarker(unsigned int colorARGB, char const * str)
+	{
+		K_PIX_BEGIN_EVENT(colorARGB, str);
+		K_NVTX_RANGE_PUSH(colorARGB, str);
+	}
+
+	~ScopedProfilingMarker()
+	{
+		K_PIX_END_EVENT();
+		K_NVTX_RANGE_POP();
+	}
+};
+
+#define K_TOKEN_PASTE(x, y) x##y
+#define K_CAT(x,y) K_TOKEN_PASTE(x,y)
+
+#define K_PUSH_PROFILING_MARKER(colorARGB, str)   K_PIX_BEGIN_EVENT(colorARGB, str); K_NVTX_RANGE_PUSH(colorARGB, str)
+#define K_POP_PROFILING_MARKER()                  K_PIX_END_EVENT(); K_NVTX_RANGE_POP()
+#define K_SCOPED_PROFILING_MARKER(colorARGB, str) ScopedProfilingMarker K_CAT(scopedMarker_, __LINE__)(colorARGB, str)
 
 #define CUDA_DRIVER_CHECK_CALL(x)                           \
 	do {                                                    \
@@ -278,6 +298,15 @@ double MeasureAndPrintFuncTime(char const * label, Func && f)
 	return duration_ms;
 }
 
+template <typename Func>
+double MeasureAndProfileAndPrintFuncTime(unsigned int colorARGB, char const * label, Func && f)
+{
+	K_PUSH_PROFILING_MARKER(colorARGB, label);
+	const double duration_ms = MeasureAndPrintFuncTime(label, std::forward<Func>(f));
+	K_POP_PROFILING_MARKER();
+	return duration_ms;
+}
+
 
 // https://github.com/kirksaunders/barrier/blob/master/barrier.hpp
 // https://stackoverflow.com/questions/24465533/implementing-boostbarrier-in-c11/
@@ -340,12 +369,16 @@ class Barrier
 
 int PinnedHostMemoryTests();
 int BinaryFormatTests();
+int UncompressedDataSingleThreadTest();
+int UncompressedDataMultiThreadTest();
 int MemoryMapTests();
 
 int main()
 {
 	//return PinnedHostMemoryTests();
-	return BinaryFormatTests();
+	//return BinaryFormatTests();
+	//return UncompressedDataSingleThreadTest();
+	return UncompressedDataMultiThreadTest();
 	// return MemoryMapTests();
 }
 
@@ -816,6 +849,9 @@ int PinnedHostMemoryTests()
 #define K_GENERATE_TEST_DATA 0
 #define K_SAVE_TEST_FILES 0
 
+static char const * kUncompressedDataFilename = "uncompressed_data.bin";
+static char const * kCompressedDataFilename = "compressed_data.bin";
+
 // https://learn.microsoft.com/en-us/windows-hardware/drivers/display/device-paging-queues
 int BinaryFormatTests()
 {
@@ -856,9 +892,6 @@ int BinaryFormatTests()
 	K_PUSH_PROFILING_MARKER(0xFFFFFFFF, "BinaryFormatTests");
 
 	K_PUSH_PROFILING_MARKER(0xFFFF0000, "Init data");
-
-	char const * kUncompressedDataFilename = "uncompressed_data.bin";
-	char const * kCompressedDataFilename = "compressed_data.bin";
 
 	#if K_GENERATE_TEST_DATA
 	const uint64_t N = (1ull * 1024 * 1024 * 1024) / sizeof(uint64_t);
@@ -1647,6 +1680,145 @@ int BinaryFormatTests()
 	if(!FreeLibrary(pixModule))
 		fprintf(stderr, "Failed to free PIX library\n");
 	#endif
+
+	return 0;
+}
+
+#pragma endregion
+
+#pragma region UncompressedDataSingleThreadTest
+
+int UncompressedDataSingleThreadTest()
+{
+	K_SCOPED_PROFILING_MARKER(0xFFFFFFFF, "UncompressedDataSingleThreadTest");
+
+	uint64_t * srcData = nullptr;
+	uint64_t srcDataByteSize = 0;
+	void * deviceMemory = nullptr;
+
+	// Loading data from disk and upload to GPU
+	{
+		K_SCOPED_PROFILING_MARKER(0xFFCCCCCCC, "Loading data from disk and upload to GPU");
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFF00FF, "Read uncompressed data", [&]()
+		{
+			if(FILE * file = fopen(kUncompressedDataFilename, "rb"))
+			{
+				fseek(file, 0L, SEEK_END);
+				srcDataByteSize = ftell(file);
+				fseek(file, 0L, SEEK_SET);
+
+				if(srcData = (uint64_t*)malloc(srcDataByteSize))
+					fread(srcData, srcDataByteSize, 1, file);
+
+				fclose(file);
+			}
+		});
+
+		if(!srcData)
+			return 1;
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFFFF00, "Allocate device memory", [&]()
+		{
+			CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, srcDataByteSize));
+		});
+	
+		MeasureAndProfileAndPrintFuncTime(0xFF00FFFF, "Memcpy host to device", [&]()
+		{
+			CUDA_CHECK_CALL(cudaMemcpy(deviceMemory, srcData, srcDataByteSize, cudaMemcpyHostToDevice));
+		});
+	}
+
+	// Clean up
+	{
+		K_SCOPED_PROFILING_MARKER(0xFFCCCCCCC, "Clean up");
+
+		MeasureAndProfileAndPrintFuncTime(0xFF0000FF, "Free device memory", [&]()
+		{
+			CUDA_CHECK_CALL(cudaFree(deviceMemory));
+		});
+
+		MeasureAndProfileAndPrintFuncTime(0xFF0088FF, "Free host memory", [&]()
+		{
+			free(srcData);
+		});
+	}
+
+	return 0;
+}
+
+#pragma endregion
+
+#pragma region UncompressedDataMultiThreadTest
+
+int UncompressedDataMultiThreadTest()
+{
+	K_SCOPED_PROFILING_MARKER(0xFFFFFFFF, "UncompressedDataMultiThreadTest");
+
+	uint64_t * srcData = nullptr;
+	uint64_t srcDataByteSize = 0;
+	void * deviceMemory = nullptr;
+
+	// Loading data from disk and upload to GPU
+	{
+		K_SCOPED_PROFILING_MARKER(0xFFCCCCCCC, "Loading data from disk and upload to GPU");
+
+		FILE * file = fopen(kUncompressedDataFilename, "rb");
+
+		if(!file)
+			return 2;
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFF00FF, "Retrieve file size", [&]()
+		{
+			fseek(file, 0L, SEEK_END);
+			srcDataByteSize = ftell(file);
+			fseek(file, 0L, SEEK_SET);
+		});
+
+		auto fileLoadingFuture = std::async(std::launch::async, [&]()
+		{
+			MeasureAndProfileAndPrintFuncTime(0xFFFF00FF, "Read uncompressed data", [&]()
+			{
+				if(srcData = (uint64_t*)malloc(srcDataByteSize))
+					fread(srcData, srcDataByteSize, 1, file);
+
+				fclose(file);
+			});
+		});
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFFFF00, "Allocate device memory", [&]()
+		{
+			CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, srcDataByteSize));
+		});
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFF8800, "Wait for file loading", [&]()
+		{
+			fileLoadingFuture.wait();
+		});
+
+		if(!srcData)
+			return 1;
+
+		MeasureAndProfileAndPrintFuncTime(0xFF00FFFF, "Memcpy host to device", [&]()
+		{
+			CUDA_CHECK_CALL(cudaMemcpy(deviceMemory, srcData, srcDataByteSize, cudaMemcpyHostToDevice));
+		});
+	}
+
+	// Clean up
+	{
+		K_SCOPED_PROFILING_MARKER(0xFFCCCCCCC, "Clean up");
+
+		MeasureAndProfileAndPrintFuncTime(0xFF0000FF, "Free device memory", [&]()
+		{
+			CUDA_CHECK_CALL(cudaFree(deviceMemory));
+		});
+
+		MeasureAndProfileAndPrintFuncTime(0xFF0088FF, "Free host memory", [&]()
+		{
+			free(srcData);
+		});
+	}
 
 	return 0;
 }
