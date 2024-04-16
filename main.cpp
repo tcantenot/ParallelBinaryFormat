@@ -812,6 +812,10 @@ int PinnedHostMemoryTests()
 	return 0;
 }
 
+
+#define K_GENERATE_TEST_DATA 0
+#define K_SAVE_TEST_FILES 0
+
 // https://learn.microsoft.com/en-us/windows-hardware/drivers/display/device-paging-queues
 int BinaryFormatTests()
 {
@@ -853,38 +857,149 @@ int BinaryFormatTests()
 
 	K_PUSH_PROFILING_MARKER(0xFFFF0000, "Init data");
 
+	char const * kUncompressedDataFilename = "uncompressed_data.bin";
+	char const * kCompressedDataFilename = "compressed_data.bin";
+
+	#if K_GENERATE_TEST_DATA
 	const uint64_t N = (1ull * 1024 * 1024 * 1024) / sizeof(uint64_t);
 	const uint64_t srcDataByteSize = N * sizeof(uint64_t);
+
 	uint64_t * srcData = (uint64_t *)malloc(srcDataByteSize);
 	for(uint64_t i = 0; i < N; ++i)
 		srcData[i] = i;
+	#else
+	uint64_t * srcData = nullptr;
+	uint64_t srcDataByteSize = 0;
+	K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Read uncompressed data");
+	if(FILE * file = fopen(kUncompressedDataFilename, "rb"))
+	{
+		fseek(file, 0L, SEEK_END);
+		srcDataByteSize = ftell(file);
+		fseek(file, 0L, SEEK_SET);
+
+		if(srcData = (uint64_t*)malloc(srcDataByteSize))
+			fread(srcData, srcDataByteSize, 1, file);
+
+		fclose(file);
+	}
+	K_POP_PROFILING_MARKER();
+
+	if(!srcData)
+		return 1;
+	#endif
+
+	#if K_SAVE_TEST_FILES
+	if(FILE * file = fopen(kUncompressedDataFilename, "wb"))
+	{
+		fwrite(srcData, srcDataByteSize, 1, file);
+		fclose(file);
+	}
+	#endif
 
 	K_POP_PROFILING_MARKER();
 
+	std::chrono::time_point<std::chrono::high_resolution_clock> start;
+	std::chrono::time_point<std::chrono::high_resolution_clock> stop;
+	std::chrono::duration<double, std::micro> duration;
+	double duration_ms = 0.0;
+
+	#if K_GENERATE_TEST_DATA
 	K_PIX_BEGIN_EVENT(0xFFFF8800, "Allocate compression buffer");
 
 	const uint64_t compressedBinaryDataByteSizeUpperBound = GetCompressedBinaryDataByteSizeUpperBound(srcDataByteSize);
-	void * compressionBuffer = malloc(compressedBinaryDataByteSizeUpperBound);
+	void * compressedDataBuffer = malloc(compressedBinaryDataByteSizeUpperBound);
 	
 	K_POP_PROFILING_MARKER();
 
 	K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Compress data");
 
-	auto start = std::chrono::high_resolution_clock::now();
-	const uint64_t compressedBinaryDataByteSize = CompressedBinaryData(compressionBuffer, srcData, srcDataByteSize, compressedBinaryDataByteSizeUpperBound);
-	auto stop = std::chrono::high_resolution_clock::now();
-	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
-	double duration_ms = duration.count() / 1000.0;
+	start = std::chrono::high_resolution_clock::now();
+	const uint64_t compressedBinaryDataByteSize = CompressedBinaryData(compressedDataBuffer, srcData, srcDataByteSize, compressedBinaryDataByteSizeUpperBound);
+	stop = std::chrono::high_resolution_clock::now();
+	duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+	duration_ms = duration.count() / 1000.0;
 	printf("Compression time: %fms - [standard]\n", duration_ms);
 
 	printf("Src byte size: %s\n", HumanReadableByteSizeStr(srcDataByteSize).c_str());
 	printf("Dst byte size: %s\n", HumanReadableByteSizeStr(compressedBinaryDataByteSize).c_str());
 	printf("Compression ratio: %f%%\n", double(compressedBinaryDataByteSize)/srcDataByteSize * 100.0);
-	PrintCompressedBinaryDataInfo(compressionBuffer);
+	PrintCompressedBinaryDataInfo(compressedDataBuffer);
+	#else
+	uint64_t * compressedDataBuffer = nullptr;
+	uint64_t compressedBinaryDataByteSize = 0;
+	K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Read compressed data");
+	if(FILE * file = fopen(kCompressedDataFilename, "rb"))
+	{
+		fseek(file, 0L, SEEK_END);
+		compressedBinaryDataByteSize = ftell(file);
+		fseek(file, 0L, SEEK_SET);
+
+		if(compressedDataBuffer = (uint64_t*)malloc(compressedBinaryDataByteSize))
+			fread(compressedDataBuffer, compressedBinaryDataByteSize, 1, file);
+
+		fclose(file);
+	}
+	K_POP_PROFILING_MARKER();
+
+	if(!compressedDataBuffer)
+		return 2;
+
+	if(0)
+	{
+		const uint64_t compressedBinaryDataByteSizeUpperBound = GetCompressedBinaryDataByteSizeUpperBound(srcDataByteSize);
+		uint64_t * compressedDataBuffer_ = (uint64_t*) malloc(compressedBinaryDataByteSizeUpperBound);
+		const uint64_t compressedBinaryDataByteSize_ = CompressedBinaryData(compressedDataBuffer_, srcData, srcDataByteSize, compressedBinaryDataByteSizeUpperBound);
+
+		printf("HERE: %llu == %llu\n", compressedBinaryDataByteSize, compressedBinaryDataByteSize_);
+
+		int cmp = memcmp(compressedDataBuffer, compressedDataBuffer_, compressedBinaryDataByteSize_);
+		if(cmp != 0)
+		{
+			for(uint64_t i = 0; i < compressedBinaryDataByteSize_/sizeof(uint64_t); ++i)
+			{
+				if(compressedDataBuffer[i] != compressedDataBuffer_[i])
+				{
+					fprintf(stderr, ">>>>>> Diff %llu: %llu != %llu\n", i, compressedDataBuffer[i], compressedDataBuffer_[i]);
+					break;
+				}
+			}
+		}
+
+		free(compressedDataBuffer_);
+	}
+
+	if(0)
+	{
+		uint64_t * decompressionBuffer = (uint64_t*)malloc(srcDataByteSize);
+		UncompressedBinaryData(decompressionBuffer, compressedDataBuffer, compressedBinaryDataByteSize, srcDataByteSize);
+		int cmp = memcmp(decompressionBuffer, srcData, srcDataByteSize);
+		if(cmp != 0)
+		{
+			for(uint64_t i = 0; i < srcDataByteSize/sizeof(uint64_t); ++i)
+			{
+				if(decompressionBuffer[i] != srcData[i])
+				{
+					fprintf(stderr, "<<>> Diff %llx: %llu != %llu\n", i, decompressionBuffer[i], srcData[i]);
+					//break;
+				}
+			}
+		}
+		free(decompressionBuffer);
+	}
+
+	#endif
+
+	#if K_SAVE_TEST_FILES
+	if(FILE * file = fopen(kCompressedDataFilename, "wb"))
+	{
+		fwrite(compressedDataBuffer, compressedBinaryDataByteSize, 1, file);
+		fclose(file);
+	}
+	#endif
 	
 	K_POP_PROFILING_MARKER();
 
-	const uint64_t uncompressedBinaryDataByteSize = GetUncompressedBinaryDataByteSize(compressionBuffer);
+	const uint64_t uncompressedBinaryDataByteSize = GetUncompressedBinaryDataByteSize(compressedDataBuffer);
 	assert(uncompressedBinaryDataByteSize == srcDataByteSize);
 
 	void * decompressionBuffer = malloc(uncompressedBinaryDataByteSize);
@@ -896,6 +1011,15 @@ int BinaryFormatTests()
 		if(cmp != 0)
 		{
 			fprintf(stderr, "Error while decompressing: uncompressedData != srcData [%s]\n", label);
+
+			for(uint64_t i = 0; i < srcDataByteSize/sizeof(uint64_t); ++i)
+			{
+				if(uncompressedData[i] != srcData[i])
+				{
+					fprintf(stderr, "Diff %llu: %llu != %llu\n", i, uncompressedData[i], srcData[i]);
+					break;
+				}
+			}
 		}
 	};
 
@@ -914,6 +1038,8 @@ int BinaryFormatTests()
 		double memcpyHostToDevice_ms;
 		MeasureAndPrintFuncTime("Single-thread decompression", [&]()
 		{
+			K_PUSH_PROFILING_MARKER(0xFFFF4488, "Single-thread decompression");
+
 			memsetHostMemoryDuration_ms = MeasureFuncTime([&]()
 			{
 				K_PUSH_PROFILING_MARKER(0xFFFFFF00, "Memset host data");
@@ -924,7 +1050,7 @@ int BinaryFormatTests()
 			decompressionDuration_ms = MeasureFuncTime([&]()
 			{
 				K_PUSH_PROFILING_MARKER(0xFF00FF00, "Uncompress data - standard");
-				uncompressedBinaryDataByteSize2 = UncompressedBinaryData(decompressionBuffer, compressionBuffer, compressedBinaryDataByteSize, uncompressedBinaryDataByteSize);
+				uncompressedBinaryDataByteSize2 = UncompressedBinaryData(decompressionBuffer, compressedDataBuffer, compressedBinaryDataByteSize, uncompressedBinaryDataByteSize);
 				K_POP_PROFILING_MARKER();
 			});
 			
@@ -934,10 +1060,12 @@ int BinaryFormatTests()
 				CUDA_CHECK_CALL(cudaMemcpy(deviceMemory, decompressionBuffer, srcDataByteSize, cudaMemcpyHostToDevice));
 				K_POP_PROFILING_MARKER();
 			});
+
+			K_POP_PROFILING_MARKER();
 		});
-		printf("  Memset host memory: %fms\n", memsetHostMemoryDuration_ms);
-		printf("  Decompression: %fms\n", decompressionDuration_ms);
-		printf("  Memcpy host -> device: %fms (bandwidth: %s/s)\n", memcpyHostToDevice_ms, HumanReadableByteSizeStr(srcDataByteSize / (memcpyHostToDevice_ms / 1000.0)).c_str());
+		printf("  Memset host memory: %fms (%s/s)\n", memsetHostMemoryDuration_ms, HumanReadableByteSizeStr(srcDataByteSize / (memsetHostMemoryDuration_ms / 1000.0)).c_str());
+		printf("  Decompression: %fms (%s/s)\n", decompressionDuration_ms, HumanReadableByteSizeStr(srcDataByteSize / (decompressionDuration_ms / 1000.0)).c_str());
+		printf("  Memcpy host -> device: %fms (%s/s)\n", memcpyHostToDevice_ms, HumanReadableByteSizeStr(srcDataByteSize / (memcpyHostToDevice_ms / 1000.0)).c_str());
 
 		assert(uncompressedBinaryDataByteSize2 == uncompressedBinaryDataByteSize);
 		assert(uncompressedBinaryDataByteSize2 == srcDataByteSize);
@@ -1071,7 +1199,7 @@ int BinaryFormatTests()
 		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Parallel decompression and CUDA buffer upload");
 		start = std::chrono::high_resolution_clock::now();
 
-		const uint64_t numChunks = GetCompressedBinaryDataNumChunks(compressionBuffer);
+		const uint64_t numChunks = GetCompressedBinaryDataNumChunks(compressedDataBuffer);
 		//dataChunksToProcess.reserve(numChunks);
 
 		struct Userdata
@@ -1089,7 +1217,7 @@ int BinaryFormatTests()
 		};
 
 		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Prepare chunks - parallel - CUDA");
-		const uint64_t uncompressedBinaryDataByteSize2 = UncompressedBinaryData(compressionBuffer, compressedBinaryDataByteSize, chunkDecompressionFunc, &userdata);
+		const uint64_t uncompressedBinaryDataByteSize2 = UncompressedBinaryData(compressedDataBuffer, compressedBinaryDataByteSize, chunkDecompressionFunc, &userdata);
 		K_POP_PROFILING_MARKER();
 
 		initializationBarrier.wait(); // Wait for workers initialization (TODO: add thread-safe queue to enqueue and process in parallel)
@@ -1157,11 +1285,13 @@ int BinaryFormatTests()
 
 		CUDA_CHECK_CALL(cudaFree(decompressionBufferDevice));
 
+		K_POP_PROFILING_MARKER();
+	}
 	
 	if(1)
 	{
 		K_PUSH_PROFILING_MARKER(0xFF0000FF, "Uncompress data - parallel - CUDA");
-		memset(decompressionBuffer, 0xFF, uncompressedBinaryDataByteSize);
+		//memset(decompressionBuffer, 0xFF, uncompressedBinaryDataByteSize);
 
 		struct DataChunkToProcess
 		{
@@ -1217,7 +1347,7 @@ int BinaryFormatTests()
 		unsigned char * decompressionWSPinnedHostMemoryStorage;
 		CUDA_CHECK_CALL(cudaHostAlloc(&decompressionWSPinnedHostMemoryStorage, decompressionWSTotalByteSize, hostAllocFlags));
 		//CUDA_CHECK_CALL(cudaMemset(decompressionWSPinnedHostMemoryStorage, 0x00, decompressionWSTotalByteSize)); // Warm up pinned memory ("MakeResident" + "CommitVirtualAddressRange" Paging Queue Packets on the "UMD Paging queue" in NVIDIA NSight Systems)
-		
+
 		for(size_t i = 0; i < decompressionWS.size(); ++i)
 		{
 			decompressionWS[i].tmpChunkPinnedHostMemoryBuffer = decompressionWSPinnedHostMemoryStorage + i * BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE;
@@ -1295,7 +1425,7 @@ int BinaryFormatTests()
 		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Parallel decompression and CUDA buffer upload");
 		start = std::chrono::high_resolution_clock::now();
 
-		const uint64_t numChunks = GetCompressedBinaryDataNumChunks(compressionBuffer);
+		const uint64_t numChunks = GetCompressedBinaryDataNumChunks(compressedDataBuffer);
 		//dataChunksToProcess.reserve(numChunks);
 
 		struct Userdata
@@ -1313,7 +1443,7 @@ int BinaryFormatTests()
 		};
 
 		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Prepare chunks - parallel - CUDA");
-		const uint64_t uncompressedBinaryDataByteSize2 = UncompressedBinaryData(compressionBuffer, compressedBinaryDataByteSize, chunkDecompressionFunc, &userdata);
+		const uint64_t uncompressedBinaryDataByteSize2 = UncompressedBinaryData(compressedDataBuffer, compressedBinaryDataByteSize, chunkDecompressionFunc, &userdata);
 		K_POP_PROFILING_MARKER();
 
 		initializationBarrier.wait(); // Wait for workers initialization (TODO: add thread-safe queue to enqueue and process in parallel)
@@ -1506,7 +1636,7 @@ int BinaryFormatTests()
 	}
 
 	free(srcData);
-	free(compressionBuffer);
+	free(compressedDataBuffer);
 	free(decompressionBuffer);
 
 	K_POP_PROFILING_MARKER();
