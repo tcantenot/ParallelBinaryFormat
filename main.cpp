@@ -367,18 +367,26 @@ class Barrier
 };
 
 
+int GenerateTestFiles();
 int PinnedHostMemoryTests();
 int BinaryFormatTests();
 int UncompressedDataSingleThreadTest();
 int UncompressedDataMultiThreadTest();
+int CompressedDataSingleThreadTest();
+int CompressedDataMultiThreadTest();
+int CompressedDataMultiThreadTest2();
 int MemoryMapTests();
 
 int main()
 {
+	//return GenerateTestFiles();
 	//return PinnedHostMemoryTests();
 	//return BinaryFormatTests();
 	//return UncompressedDataSingleThreadTest();
-	return UncompressedDataMultiThreadTest();
+	//return UncompressedDataMultiThreadTest();
+	//return CompressedDataSingleThreadTest();
+	//return CompressedDataMultiThreadTest();
+	return CompressedDataMultiThreadTest2();
 	// return MemoryMapTests();
 }
 
@@ -846,11 +854,56 @@ int PinnedHostMemoryTests()
 }
 
 
-#define K_GENERATE_TEST_DATA 0
-#define K_SAVE_TEST_FILES 0
 
 static char const * kUncompressedDataFilename = "uncompressed_data.bin";
 static char const * kCompressedDataFilename = "compressed_data.bin";
+
+int GenerateTestFiles()
+{
+	std::chrono::time_point<std::chrono::high_resolution_clock> start;
+	std::chrono::time_point<std::chrono::high_resolution_clock> stop;
+	std::chrono::duration<double, std::micro> duration;
+	double duration_ms = 0.0;
+
+	const uint64_t N = (1ull * 1024 * 1024 * 1024) / sizeof(uint64_t);
+	const uint64_t srcDataByteSize = N * sizeof(uint64_t);
+
+	uint64_t * srcData = (uint64_t *)malloc(srcDataByteSize);
+	for(uint64_t i = 0; i < N; ++i)
+		srcData[i] = i;
+
+	if(FILE * file = fopen(kUncompressedDataFilename, "wb"))
+	{
+		fwrite(srcData, srcDataByteSize, 1, file);
+		fclose(file);
+	}
+
+	const uint64_t compressedBinaryDataByteSizeUpperBound = GetCompressedBinaryDataByteSizeUpperBound(srcDataByteSize);
+	void * compressedDataBuffer = malloc(compressedBinaryDataByteSizeUpperBound);
+	
+	start = std::chrono::high_resolution_clock::now();
+	const uint64_t compressedBinaryDataByteSize = CompressedBinaryData(compressedDataBuffer, srcData, srcDataByteSize, compressedBinaryDataByteSizeUpperBound);
+	stop = std::chrono::high_resolution_clock::now();
+	duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+	duration_ms = duration.count() / 1000.0;
+	printf("Compression time: %fms - [standard]\n", duration_ms);
+
+	printf("Src byte size: %s\n", HumanReadableByteSizeStr(srcDataByteSize).c_str());
+	printf("Dst byte size: %s\n", HumanReadableByteSizeStr(compressedBinaryDataByteSize).c_str());
+	printf("Compression ratio: %f%%\n", double(compressedBinaryDataByteSize)/srcDataByteSize * 100.0);
+	PrintCompressedBinaryDataInfo(compressedDataBuffer);
+
+	if(FILE * file = fopen(kCompressedDataFilename, "wb"))
+	{
+		fwrite(compressedDataBuffer, compressedBinaryDataByteSize, 1, file);
+		fclose(file);
+	}
+
+	return 0;
+}
+
+#define K_GENERATE_TEST_DATA 0
+#define K_SAVE_TEST_FILES 0
 
 // https://learn.microsoft.com/en-us/windows-hardware/drivers/display/device-paging-queues
 int BinaryFormatTests()
@@ -1692,7 +1745,7 @@ int UncompressedDataSingleThreadTest()
 {
 	K_SCOPED_PROFILING_MARKER(0xFFFFFFFF, "UncompressedDataSingleThreadTest");
 
-	uint64_t * srcData = nullptr;
+	void * srcData = nullptr;
 	uint64_t srcDataByteSize = 0;
 	void * deviceMemory = nullptr;
 
@@ -1708,7 +1761,7 @@ int UncompressedDataSingleThreadTest()
 				srcDataByteSize = ftell(file);
 				fseek(file, 0L, SEEK_SET);
 
-				if(srcData = (uint64_t*)malloc(srcDataByteSize))
+				if(srcData = malloc(srcDataByteSize))
 					fread(srcData, srcDataByteSize, 1, file);
 
 				fclose(file);
@@ -1716,7 +1769,7 @@ int UncompressedDataSingleThreadTest()
 		});
 
 		if(!srcData)
-			return 1;
+			return __LINE__;
 
 		MeasureAndProfileAndPrintFuncTime(0xFFFFFF00, "Allocate device memory", [&]()
 		{
@@ -1755,7 +1808,7 @@ int UncompressedDataMultiThreadTest()
 {
 	K_SCOPED_PROFILING_MARKER(0xFFFFFFFF, "UncompressedDataMultiThreadTest");
 
-	uint64_t * srcData = nullptr;
+	void * srcData = nullptr;
 	uint64_t srcDataByteSize = 0;
 	void * deviceMemory = nullptr;
 
@@ -1766,7 +1819,7 @@ int UncompressedDataMultiThreadTest()
 		FILE * file = fopen(kUncompressedDataFilename, "rb");
 
 		if(!file)
-			return 2;
+			return __LINE__;
 
 		MeasureAndProfileAndPrintFuncTime(0xFFFF00FF, "Retrieve file size", [&]()
 		{
@@ -1779,7 +1832,7 @@ int UncompressedDataMultiThreadTest()
 		{
 			MeasureAndProfileAndPrintFuncTime(0xFFFF00FF, "Read uncompressed data", [&]()
 			{
-				if(srcData = (uint64_t*)malloc(srcDataByteSize))
+				if(srcData = malloc(srcDataByteSize))
 					fread(srcData, srcDataByteSize, 1, file);
 
 				fclose(file);
@@ -1791,13 +1844,16 @@ int UncompressedDataMultiThreadTest()
 			CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, srcDataByteSize));
 		});
 
+		if(!deviceMemory)
+			return __LINE__;
+
 		MeasureAndProfileAndPrintFuncTime(0xFFFF8800, "Wait for file loading", [&]()
 		{
 			fileLoadingFuture.wait();
 		});
 
 		if(!srcData)
-			return 1;
+			return __LINE__;
 
 		MeasureAndProfileAndPrintFuncTime(0xFF00FFFF, "Memcpy host to device", [&]()
 		{
@@ -1817,6 +1873,671 @@ int UncompressedDataMultiThreadTest()
 		MeasureAndProfileAndPrintFuncTime(0xFF0088FF, "Free host memory", [&]()
 		{
 			free(srcData);
+		});
+	}
+
+	return 0;
+}
+
+#pragma endregion
+
+#pragma region CompressedDataSingleThreadTest
+
+int CompressedDataSingleThreadTest()
+{
+	K_SCOPED_PROFILING_MARKER(0xFFFFFFFF, "CompressedDataSingleThreadTest");
+
+	void * hCompressedData = nullptr;
+	uint64_t compressedDataByteSize = 0;
+	void * hUncompressedData = nullptr;
+	uint64_t uncompressedDataByteSize = 0;
+	void * deviceMemory = nullptr;
+
+	// Loading data from disk and upload to GPU
+	{
+		K_SCOPED_PROFILING_MARKER(0xFFCCCCCCC, "Loading data from disk and upload to GPU");
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFF00FF, "Read compressed data", [&]()
+		{
+			if(FILE * file = fopen(kCompressedDataFilename, "rb"))
+			{
+				fseek(file, 0L, SEEK_END);
+				compressedDataByteSize = ftell(file);
+				fseek(file, 0L, SEEK_SET);
+
+				if(hCompressedData = malloc(compressedDataByteSize))
+					fread(hCompressedData, compressedDataByteSize, 1, file);
+
+				fclose(file);
+			}
+		});
+
+		if(!hCompressedData)
+			return __LINE__;
+
+		uncompressedDataByteSize = GetUncompressedBinaryDataByteSize(hCompressedData);
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFF8800, "Uncompress data", [&]()
+		{
+			if(hUncompressedData = malloc(uncompressedDataByteSize))
+			{
+				const uint64_t uncompressedDataByteSize2 = UncompressedBinaryData(hUncompressedData, hCompressedData, compressedDataByteSize, uncompressedDataByteSize);
+				assert(uncompressedDataByteSize2 == uncompressedDataByteSize);
+			}
+		});
+
+		if(!hUncompressedData)
+			return __LINE__;
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFFFF00, "Allocate device memory", [&]()
+		{
+			CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, uncompressedDataByteSize));
+		});
+	
+		MeasureAndProfileAndPrintFuncTime(0xFF00FFFF, "Memcpy host to device", [&]()
+		{
+			CUDA_CHECK_CALL(cudaMemcpy(deviceMemory, hUncompressedData, uncompressedDataByteSize, cudaMemcpyHostToDevice));
+		});
+	}
+
+	// Data validation
+	{
+		K_SCOPED_PROFILING_MARKER(0xFF55FF00, "Data validation");
+
+		void * referenceData = nullptr;
+		uint64_t referenceDataByteSize = 0;
+		if(FILE * file = fopen(kUncompressedDataFilename, "rb"))
+		{
+			fseek(file, 0L, SEEK_END);
+			referenceDataByteSize = ftell(file);
+			fseek(file, 0L, SEEK_SET);
+
+			if(referenceData = malloc(compressedDataByteSize))
+				fread(referenceData, referenceDataByteSize, 1, file);
+
+			fclose(file);
+		}
+
+		if(!referenceData)
+			return __LINE__;
+
+		if(uncompressedDataByteSize != referenceDataByteSize)
+		{
+			fprintf(stderr, "Incorrect uncompressed data byte size: expected %llu got %llu\n", referenceDataByteSize, uncompressedDataByteSize);
+			return __LINE__;
+		}
+
+		if(!memcmp(hUncompressedData, referenceData, referenceDataByteSize))
+		{
+			fprintf(stderr, "Incorrect uncompressed data\n");
+			return __LINE__;
+		}
+	}
+
+	// Clean up
+	{
+		K_SCOPED_PROFILING_MARKER(0xFFCCCCCCC, "Clean up");
+
+		MeasureAndProfileAndPrintFuncTime(0xFF0000FF, "Free device memory", [&]()
+		{
+			CUDA_CHECK_CALL(cudaFree(deviceMemory));
+		});
+
+		MeasureAndProfileAndPrintFuncTime(0xFF0088FF, "Free host memory", [&]()
+		{
+			free(hCompressedData);
+			free(hUncompressedData);
+		});
+	}
+
+	return 0;
+}
+
+#pragma endregion
+
+#pragma region CompressedDataMultiThreadTest
+
+int CompressedDataMultiThreadTest()
+{
+	K_SCOPED_PROFILING_MARKER(0xFFFFFFFF, "CompressedDataMultiThreadTest");
+
+	void * hCompressedData = nullptr;
+	uint64_t compressedDataByteSize = 0;
+	void * hUncompressedData = nullptr;
+	uint64_t uncompressedDataByteSize = 0;
+	void * deviceMemory = nullptr;
+
+	// Loading data from disk and upload to GPU
+	{
+		K_SCOPED_PROFILING_MARKER(0xFFCCCCCCC, "Loading data from disk and upload to GPU");
+
+		FILE * file = fopen(kCompressedDataFilename, "rb");
+
+		if(!file)
+			return __LINE__;
+
+		BinDataHeader binDataHeader;
+		MeasureAndProfileAndPrintFuncTime(0xFFFF00FF, "Retrieve file size and uncompressed data size", [&]()
+		{
+			fseek(file, 0L, SEEK_END);
+			compressedDataByteSize = ftell(file);
+			fseek(file, 0L, SEEK_SET);
+
+			fread(&binDataHeader, sizeof(binDataHeader), 1, file);
+			fseek(file, 0L, SEEK_SET);
+		});
+
+		uncompressedDataByteSize = binDataHeader.uncompressedByteSize;
+
+		auto fileLoadingFuture = std::async(std::launch::async, [&]()
+		{
+			MeasureAndProfileAndPrintFuncTime(0xFFFF00FF, "Read uncompressed data", [&]()
+			{
+				if(hCompressedData = malloc(compressedDataByteSize))
+					fread(hCompressedData, compressedDataByteSize, 1, file);
+
+				fclose(file);
+			});
+		});
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFFFF00, "Allocate device memory", [&]()
+		{
+			CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, uncompressedDataByteSize));
+		});
+
+		if(!deviceMemory)
+			return __LINE__;
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFF8800, "Wait for file loading", [&]()
+		{
+			fileLoadingFuture.wait();
+		});
+
+		if(!hCompressedData)
+			return __LINE__;
+
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFF8800, "Uncompress data", [&]()
+		{
+			if(hUncompressedData = malloc(uncompressedDataByteSize))
+			{
+				const uint64_t uncompressedDataByteSize2 = UncompressedBinaryData(hUncompressedData, hCompressedData, compressedDataByteSize, uncompressedDataByteSize);
+				assert(uncompressedDataByteSize2 == uncompressedDataByteSize);
+			}
+		});
+
+		if(!hUncompressedData)
+			return __LINE__;
+
+		MeasureAndProfileAndPrintFuncTime(0xFF00FFFF, "Memcpy host to device", [&]()
+		{
+			CUDA_CHECK_CALL(cudaMemcpy(deviceMemory, hUncompressedData, uncompressedDataByteSize, cudaMemcpyHostToDevice));
+		});
+	}
+
+	// Data validation
+	{
+		K_SCOPED_PROFILING_MARKER(0xFF55FF00, "Data validation");
+
+		void * referenceData = nullptr;
+		uint64_t referenceDataByteSize = 0;
+		if(FILE * file = fopen(kUncompressedDataFilename, "rb"))
+		{
+			fseek(file, 0L, SEEK_END);
+			referenceDataByteSize = ftell(file);
+			fseek(file, 0L, SEEK_SET);
+
+			if(referenceData = malloc(compressedDataByteSize))
+				fread(referenceData, referenceDataByteSize, 1, file);
+
+			fclose(file);
+		}
+
+		if(!referenceData)
+			return __LINE__;
+
+		if(uncompressedDataByteSize != referenceDataByteSize)
+		{
+			fprintf(stderr, "Incorrect uncompressed data byte size: expected %llu got %llu\n", referenceDataByteSize, uncompressedDataByteSize);
+			return __LINE__;
+		}
+
+		if(!memcmp(hUncompressedData, referenceData, referenceDataByteSize))
+		{
+			fprintf(stderr, "Incorrect uncompressed data\n");
+			return __LINE__;
+		}
+	}
+
+	// Clean up
+	{
+		K_SCOPED_PROFILING_MARKER(0xFFCCCCCCC, "Clean up");
+
+		MeasureAndProfileAndPrintFuncTime(0xFF0000FF, "Free device memory", [&]()
+		{
+			CUDA_CHECK_CALL(cudaFree(deviceMemory));
+		});
+
+		MeasureAndProfileAndPrintFuncTime(0xFF0088FF, "Free host memory", [&]()
+		{
+			free(hCompressedData);
+			free(hUncompressedData);
+		});
+	}
+
+	return 0;
+}
+
+#pragma endregion
+
+#pragma region CompressedDataMultiThreadTest2
+
+int CompressedDataMultiThreadTest2()
+{
+	K_SCOPED_PROFILING_MARKER(0xFFFFFFFF, "CompressedDataMultiThreadTest2");
+
+	void * hCompressedData = nullptr;
+	uint64_t compressedDataByteSize = 0;
+	void * hUncompressedData = nullptr;
+	uint64_t uncompressedDataByteSize = 0;
+	void * deviceMemory = nullptr;
+
+	std::chrono::time_point<std::chrono::high_resolution_clock> start;
+	std::chrono::time_point<std::chrono::high_resolution_clock> stop;
+	std::chrono::duration<double, std::micro> duration;
+	double duration_ms = 0.0;
+
+	// Loading data from disk and upload to GPU
+	{
+		K_SCOPED_PROFILING_MARKER(0xFFCCCCCCC, "Loading data from disk and upload to GPU");
+
+		FILE * file = nullptr;
+		
+		MeasureAndProfileAndPrintFuncTime(0xFFFF00FF, "Open file", [&]()
+		{
+			file = fopen(kCompressedDataFilename, "rb");
+		});
+
+		if(!file)
+			return __LINE__;
+
+		BinDataHeader binDataHeader;
+		MeasureAndProfileAndPrintFuncTime(0xFFFF00FF, "Retrieve file size and uncompressed data size", [&]()
+		{
+			fseek(file, 0L, SEEK_END);
+			compressedDataByteSize = ftell(file);
+			fseek(file, 0L, SEEK_SET);
+
+			fread(&binDataHeader, sizeof(binDataHeader), 1, file);
+			fseek(file, 0L, SEEK_SET);
+		});
+
+		uncompressedDataByteSize = binDataHeader.uncompressedByteSize;
+
+		auto fileLoadingFuture = std::async(std::launch::async, [&]()
+		{
+			MeasureAndProfileAndPrintFuncTime(0xFFFF00FF, "Read uncompressed data", [&]()
+			{
+				if(hCompressedData = malloc(compressedDataByteSize))
+					fread(hCompressedData, compressedDataByteSize, 1, file);
+
+				fclose(file);
+			});
+		});
+
+		// Explicity perform device initialization
+		// https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__DRIVER.html
+		//  "The CUDA Runtime API will automatically initialize the primary context for a device at the first CUDA Runtime API call
+		//   which requires an active context. If no CUcontext is current to the calling thread when a CUDA Runtime API call which
+		//   requires an active context is made, then the primary context for a device will be selected, made current to the
+		//   calling thread, and initialized."
+		MeasureAndProfileAndPrintFuncTime(0xFFFFFF00, "CUDA device init", [&]()
+		{
+			//CUDA_DRIVER_CHECK_CALL(cuInit(0)); // Faster but partial init: next cudaMalloc(1GB) will be around 110ms
+			CUDA_CHECK_CALL(cudaInitDevice(0, 0, 0)); // Slower but full init: next cudaMalloc(1GB) will be around 2ms
+		});
+		
+		struct DataChunkToProcess
+		{
+			unsigned char * dst;
+			unsigned char const * src;
+			uint32_t srcByteSize;
+			uint32_t dstByteSize;
+		};
+
+		// TODO: use SPMC queue?
+		std::queue<DataChunkToProcess> dataChunksToProcess;
+
+		struct DecompressionWorkspace
+		{
+			unsigned char * tmpChunkPinnedHostMemoryBuffer;
+			size_t tmpChunkPinnedHostMemoryByteSize;
+			cudaStream_t memcpyStream;
+			std::mutex tmpDecompressionBufferMutex;
+			std::condition_variable tmpDecompressionBufferCV;
+			bool bDecompressing = false;
+		};
+
+		std::mutex queueMutex;
+		std::condition_variable queueCV;
+		bool bReady = false;
+		bool bKillThreads = false;
+
+		const int numThreads = std::thread::hardware_concurrency() - 2;
+		printf("Num threads: %d\n", numThreads);
+		std::vector<std::thread> workers(numThreads);
+
+		#if 0
+		static constexpr uint32_t kNumBufferedChunks = 12;
+		const uint64_t numDecompressionWorkspace = numThreads * kNumBufferedChunks;
+		#else
+		const uint64_t maxPinnedHostMemoryByteSize = 512ull * 1024ull * 1024ull;
+		const uint64_t numDecompressionWorkspace = maxPinnedHostMemoryByteSize / BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE;
+		// Note: would also need to limit the number of threads if numDecompressionWorkspace < thread_pool_size * some_multiplier
+		#endif
+
+		#define K_ALLOCATE_PINNED_HOST_MEMORY_ON_THREADS 1
+		#define K_INITIALIZE_CUDA_STREAMS_ON_THREADS 0
+		#define K_INITIALIZE_CUDA_STREAMS_ASYNC 1
+
+		std::vector<DecompressionWorkspace> decompressionWS(numDecompressionWorkspace);
+
+		#if K_INITIALIZE_CUDA_STREAMS_ASYNC
+		auto cudaStreamCreationFuture = std::async(std::launch::async, [&]()
+		{
+			MeasureAndProfileAndPrintFuncTime(0xFFFF00FF, "Initialize CUDA streams", [&]()
+			{
+				for(size_t i = 0; i < decompressionWS.size(); ++i)
+				{
+					//CUDA_CHECK_CALL(cudaStreamCreate(&decompressionWS[i].memcpyStream));
+					CUDA_CHECK_CALL(cudaStreamCreateWithFlags(&decompressionWS[i].memcpyStream, cudaStreamNonBlocking));
+				}
+			});
+		});
+		#else
+		MeasureAndProfileAndPrintFuncTime(0xFF8899FF, "Initialize CUDA streams", [&]()
+		{
+			for(size_t i = 0; i < decompressionWS.size(); ++i)
+			{
+				#if K_INITIALIZE_CUDA_STREAMS_ON_THREADS
+				decompressionWS[i].memcpyStream = nullptr;
+				#else
+				CUDA_CHECK_CALL(cudaStreamCreate(&decompressionWS[i].memcpyStream));
+				#endif
+			}
+		});
+		#endif
+
+		#define USE_WRITE_COMBINED_MEMORY 0 // Note: **Really** slow because the LZ4 decompression routine read from the output buffer while decompressing
+
+		#if USE_WRITE_COMBINED_MEMORY
+		const unsigned int hostAllocFlags = cudaHostAllocWriteCombined;
+		#else
+		const unsigned int hostAllocFlags = cudaHostAllocDefault;
+		#endif
+
+		const uint64_t decompressionWSTotalByteSize = decompressionWS.size() * BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE;
+		// https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#asynchronous-and-overlapping-transfers-with-computation
+		unsigned char * decompressionWSPinnedHostMemoryStorage;
+
+		MeasureAndProfileAndPrintFuncTime(0xFF8899FF, "Initialize pinned host memory", [&]()
+		{
+			#if !K_ALLOCATE_PINNED_HOST_MEMORY_ON_THREADS
+			CUDA_CHECK_CALL(cudaHostAlloc(&decompressionWSPinnedHostMemoryStorage, decompressionWSTotalByteSize, hostAllocFlags));
+			//CUDA_CHECK_CALL(cudaMemset(decompressionWSPinnedHostMemoryStorage, 0x00, decompressionWSTotalByteSize)); // Warm up pinned memory ("MakeResident" + "CommitVirtualAddressRange" Paging Queue Packets on the "UMD Paging queue" in NVIDIA NSight Systems)
+			#endif
+
+			for(size_t i = 0; i < decompressionWS.size(); ++i)
+			{
+				#if K_ALLOCATE_PINNED_HOST_MEMORY_ON_THREADS
+				decompressionWS[i].tmpChunkPinnedHostMemoryBuffer = nullptr;
+				#else
+				decompressionWS[i].tmpChunkPinnedHostMemoryBuffer = decompressionWSPinnedHostMemoryStorage + i * BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE;
+				#endif
+
+				decompressionWS[i].tmpChunkPinnedHostMemoryByteSize = BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE;
+			}
+		});
+
+		Barrier barrier(numThreads + 1);
+		Barrier & initializationBarrier = barrier;
+		Barrier & processingDoneBarrier = barrier;
+
+		std::atomic<uint32_t> decompressionWSIndex = 0;
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFF8899, "Initialize worker threads", [&]()
+		{
+			for(int i = 0; i < numThreads; ++i)
+			{
+				workers[i] = std::thread([&]()
+				{
+					initializationBarrier.wait(); // Wait for initialization of all workers and main thread
+
+					while(true)
+					{
+						K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Uncompress chunk - wait");
+						std::unique_lock<std::mutex> lock(queueMutex);
+						queueCV.wait(lock, [&]{ return (/*bReady && */!dataChunksToProcess.empty()) || bKillThreads; });
+						K_POP_PROFILING_MARKER();
+
+						if(bKillThreads)
+							break;
+
+						K_PUSH_PROFILING_MARKER(0xFF0077FF, "Uncompress chunk - pop item");
+						DataChunkToProcess chunk = dataChunksToProcess.front();
+						dataChunksToProcess.pop();
+						lock.unlock();
+						K_POP_PROFILING_MARKER();
+
+						uint32_t index = decompressionWSIndex++;
+						index = index % decompressionWS.size();
+
+						K_PUSH_PROFILING_MARKER(0xFF885522, "DecompressionWorkspace - wait");
+						DecompressionWorkspace & decompressionWorkspace = decompressionWS[index];
+						std::unique_lock<std::mutex> decompressionWSLock(decompressionWorkspace.tmpDecompressionBufferMutex);
+						decompressionWorkspace.tmpDecompressionBufferCV.wait(decompressionWSLock, [&]{ return !decompressionWorkspace.bDecompressing; });
+						K_POP_PROFILING_MARKER();
+
+						decompressionWorkspace.bDecompressing = true;
+
+						#if K_ALLOCATE_PINNED_HOST_MEMORY_ON_THREADS
+						if(!decompressionWorkspace.tmpChunkPinnedHostMemoryBuffer)
+						{
+							K_SCOPED_PROFILING_MARKER(0xFFFF0000, "Allocate pinned host memory");
+							CUDA_CHECK_CALL(cudaHostAlloc(&decompressionWorkspace.tmpChunkPinnedHostMemoryBuffer, decompressionWorkspace.tmpChunkPinnedHostMemoryByteSize, hostAllocFlags));
+						}
+						#endif
+
+						#if K_INITIALIZE_CUDA_STREAMS_ON_THREADS
+						if(!decompressionWorkspace.memcpyStream)
+						{
+							K_SCOPED_PROFILING_MARKER(0xFFFF8800, "Initialize CUDA stream");
+							CUDA_CHECK_CALL(cudaStreamCreate(&decompressionWorkspace.memcpyStream));
+						}
+						#endif
+
+						K_PUSH_PROFILING_MARKER(0xFF0000FF, "cudaStreamSynchronize");
+						CUDA_CHECK_CALL(cudaStreamSynchronize(decompressionWorkspace.memcpyStream)); // Ensure previous async copy is done
+						K_POP_PROFILING_MARKER();
+
+						K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Uncompress chunk - parallel - CUDA");
+						assert(chunk.dstByteSize <= BinDataHeader::MAX_CHUNKS_UNCOMPRESSED_BYTE_SIZE);
+						Uncompress(decompressionWorkspace.tmpChunkPinnedHostMemoryBuffer, chunk.src, chunk.srcByteSize, chunk.dstByteSize);
+						K_POP_PROFILING_MARKER();
+
+						K_PUSH_PROFILING_MARKER(0xFF0000FF, "cudaMemcpyAsync");
+						CUDA_CHECK_CALL(cudaMemcpyAsync(chunk.dst, decompressionWorkspace.tmpChunkPinnedHostMemoryBuffer, chunk.dstByteSize, cudaMemcpyHostToDevice, decompressionWorkspace.memcpyStream));
+						//CUDA_CHECK_CALL(cudaMemcpy(chunk.dst, decompressionWorkspace.tmpChunkPinnedHostMemoryBuffer, chunk.dstByteSize, cudaMemcpyHostToDevice));
+						K_POP_PROFILING_MARKER();
+
+						K_PUSH_PROFILING_MARKER(0xFFFFFF00, "DecompressionWorkspace - unlock and notify");
+						decompressionWorkspace.bDecompressing = false;
+						decompressionWSLock.unlock();
+						decompressionWorkspace.tmpDecompressionBufferCV.notify_one();
+						K_POP_PROFILING_MARKER();
+					}
+
+					processingDoneBarrier.wait(); // Wait for workers exiting their processing loop
+				});
+			}
+		});
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFFFF00, "Allocate device memory", [&]()
+		{
+			CUDA_CHECK_CALL(cudaMalloc(&deviceMemory, uncompressedDataByteSize));
+		});
+
+		if(!deviceMemory)
+			return __LINE__;
+
+		MeasureAndProfileAndPrintFuncTime(0xFFFF8800, "Wait for file loading", [&]()
+		{
+			fileLoadingFuture.wait();
+		});
+
+		if(!hCompressedData)
+			return __LINE__;
+
+		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Parallel decompression and CUDA buffer upload");
+		start = std::chrono::high_resolution_clock::now();
+
+		const uint64_t numChunks = GetCompressedBinaryDataNumChunks(hCompressedData);
+		//dataChunksToProcess.reserve(numChunks);
+
+		struct Userdata
+		{
+			void * pBaseDstChunkDataDevice;
+			std::queue<DataChunkToProcess> & dataChunksToProcess;
+		};
+
+		Userdata userdata = { deviceMemory, dataChunksToProcess };
+		const auto chunkDecompressionFunc = [](unsigned char const * pSrcChunkData, uint32_t srcChunkByteSize, uint64_t dstByteOffset, uint32_t dstChunkByteSize, void * pUserdata)
+		{
+			Userdata const & userdata = *(Userdata const *)pUserdata;
+			unsigned char * pDstChunkData = (unsigned char*)userdata.pBaseDstChunkDataDevice + dstByteOffset;
+			userdata.dataChunksToProcess.push({pDstChunkData, pSrcChunkData, srcChunkByteSize, dstChunkByteSize});
+		};
+
+		K_PUSH_PROFILING_MARKER(0xFF00FFFF, "Prepare chunks - parallel - CUDA");
+		const uint64_t uncompressedBinaryDataByteSize2 = UncompressedBinaryData(hCompressedData, compressedDataByteSize, chunkDecompressionFunc, &userdata);
+		K_POP_PROFILING_MARKER();
+
+		#if K_INITIALIZE_CUDA_STREAMS_ASYNC
+		cudaStreamCreationFuture.wait();
+		#endif
+
+		initializationBarrier.wait(); // Wait for workers initialization (TODO: add thread-safe queue to enqueue and process in parallel)
+
+		#if 0
+		while(!dataChunksToProcess.empty())
+		{
+			DataChunkToProcess const & chunk = dataChunksToProcess.front();
+			Uncompress(chunk.dst, chunk.src, chunk.srcByteSize, chunk.dstMaxByteSize);
+			dataChunksToProcess.pop();
+		}
+		#else
+		// Notify workers to start working
+		//{
+		//	std::unique_lock<std::mutex> lock(queueMutex);
+		//	bReady = true;
+		//}
+		queueCV.notify_all();
+		#endif
+
+		// Waits for workers to finish
+		// TODO: find a better way to check that workers are done
+		K_PUSH_PROFILING_MARKER(0xFFFF00FF, "Main thread - wait for workers"); // TODO: make main thread participate as well?
+		while(true)
+		{
+			bool bProcessingDone;
+			{
+				std::unique_lock<std::mutex> lock(queueMutex);
+				if(bProcessingDone = dataChunksToProcess.empty())
+				{
+					bKillThreads = true;
+					queueCV.notify_all();
+				}
+			}
+			
+			if(bProcessingDone)
+				break;
+
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		K_POP_PROFILING_MARKER();
+
+		K_PUSH_PROFILING_MARKER(0xFF55FF88, "cudaDeviceSynchronize"); // TODO: make main thread participate as well?
+		CUDA_CHECK_CALL(cudaDeviceSynchronize()); // Wait for all copies to finish (TODO: try to call cudaStreamSynchronize in parallel by worker threads?)
+		K_POP_PROFILING_MARKER();
+
+		processingDoneBarrier.wait(); // Wait for workers exiting their processing loop
+
+		K_POP_PROFILING_MARKER();
+
+		stop = std::chrono::high_resolution_clock::now();
+		duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+		duration_ms = duration.count() / 1000.0;
+		printf("Decompression time and GPU upload time: %fms - [parallel - CUDA]\n", duration_ms);
+
+		K_PUSH_PROFILING_MARKER(0xFFFF7766, "Workers join");
+		for(std::thread & w : workers)
+			w.join();
+		K_POP_PROFILING_MARKER();
+	}
+
+	// Data validation
+	{
+		K_SCOPED_PROFILING_MARKER(0xFF55FF00, "Data validation");
+
+		void * referenceData = nullptr;
+		uint64_t referenceDataByteSize = 0;
+		if(FILE * file = fopen(kUncompressedDataFilename, "rb"))
+		{
+			fseek(file, 0L, SEEK_END);
+			referenceDataByteSize = ftell(file);
+			fseek(file, 0L, SEEK_SET);
+
+			if(referenceData = malloc(compressedDataByteSize))
+				fread(referenceData, referenceDataByteSize, 1, file);
+
+			fclose(file);
+		}
+
+		if(!referenceData)
+			return __LINE__;
+
+		if(uncompressedDataByteSize != referenceDataByteSize)
+		{
+			fprintf(stderr, "Incorrect uncompressed data byte size: expected %llu got %llu\n", referenceDataByteSize, uncompressedDataByteSize);
+			return __LINE__;
+		}
+
+		hUncompressedData = malloc(uncompressedDataByteSize);
+		if(!hUncompressedData)
+			return __LINE__;
+
+		CUDA_CHECK_CALL(cudaMemcpy(hUncompressedData, deviceMemory, uncompressedDataByteSize, cudaMemcpyDeviceToHost));
+
+		if(!memcmp(hUncompressedData, referenceData, referenceDataByteSize))
+		{
+			fprintf(stderr, "Incorrect uncompressed data\n");
+			return __LINE__;
+		}
+	}
+
+	// Clean up
+	{
+		K_SCOPED_PROFILING_MARKER(0xFFCCCCCCC, "Clean up");
+
+		MeasureAndProfileAndPrintFuncTime(0xFF0000FF, "Free device memory", [&]()
+		{
+			CUDA_CHECK_CALL(cudaFree(deviceMemory));
+		});
+
+		MeasureAndProfileAndPrintFuncTime(0xFF0088FF, "Free host memory", [&]()
+		{
+			free(hCompressedData);
+			free(hUncompressedData);
 		});
 	}
 
